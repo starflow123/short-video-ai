@@ -1,0 +1,87 @@
+name: ai-video-studio
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: aivideo
+      POSTGRES_PASSWORD: aivideo
+      POSTGRES_DB: aivideo
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aivideo"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ../backend
+    env_file:
+      - ../backend/.env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://aivideo:aivideo@postgres:5432/aivideo
+      REDIS_URL: redis://redis:6379/0
+      MEDIA_ROOT: /data/media
+    volumes:
+      - media:/data/media
+    ports:
+      # 只绑本机：前端通过 nginx 反代访问后端，避免把 API/媒体直接暴露到局域网
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      sh -c "alembic upgrade head &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ../backend
+    env_file:
+      - ../backend/.env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://aivideo:aivideo@postgres:5432/aivideo
+      REDIS_URL: redis://redis:6379/0
+      MEDIA_ROOT: /data/media
+    volumes:
+      - media:/data/media
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # -B 启用内置 beat，每 5 分钟巡检一次卡死任务；单 worker 部署不需要独立 beat 容器
+    command: ["celery", "-A", "app.worker.celery_app", "worker", "--loglevel=info", "--concurrency=2", "-B"]
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ../frontend
+    ports:
+      - "7788:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  redisdata:
+  media:

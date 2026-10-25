@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Node
+node_modules/
+dist/
+.vite/
+
+# Env & secrets
+.env
+.env.local
+*.local
+
+# Media & data
+data/
+*.log
+*.mp4
+*.webm
+*.mov
+
+# Local runtime artifacts / probes
+tmp/
+tmp_check/
+vibe_images/
+.tok
+*.pem
+*.key
+
+# IDE
+.idea/
+.vscode/
+.DS_Store
