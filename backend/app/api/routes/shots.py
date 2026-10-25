@@ -27,8 +27,13 @@ from app.schemas.content import (
 )
 from app.schemas.task import GenerationRequest, TaskRead
 from app.services.dispatch import create_task
-from app.services.generation import build_prompt_preview, load_shot_neighbors, suggest_shot_field
-from app.services.keyframes import load_keyframes, primary_keyframe, set_primary
+from app.services.generation import (
+    build_prompt_preview,
+    ensure_shot_cast_references,
+    load_shot_neighbors,
+    suggest_shot_field,
+)
+from app.services.keyframes import approve, load_keyframes, primary_keyframe, set_primary
 from app.services.references import media_of_shots, purge_media, remove_media_files
 
 router = APIRouter(prefix="/shots", tags=["分镜"])
@@ -215,6 +220,9 @@ async def update_keyframe(
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="关键帧素材无效")
 
     make_primary = values.pop("is_primary", None)
+    if values.get("media_id") is not None and values["media_id"] != keyframe.media_id:
+        # 换了画面就不再是用户认可过的那一帧
+        keyframe.approved_at = None
     for field, value in values.items():
         setattr(keyframe, field, value)
     if make_primary:
@@ -222,6 +230,103 @@ async def update_keyframe(
     await db.commit()
     await db.refresh(keyframe)
     return await serialize_keyframe(db, keyframe)
+
+
+@router.post("/{shot_id}/keyframes/{keyframe_id}/approve", response_model=ShotKeyframeRead)
+async def approve_keyframe(
+    shot_id: int,
+    keyframe_id: int,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> ShotKeyframeRead:
+    """认可这一帧：成为该镜头唯一已认可的关键帧，并自动设为主帧（视频首帧）。
+
+    批量生视频只消费已认可的帧；重绘后认可自动失效，必须重新看过。
+    """
+    shot = await _get_owned_shot(db, user.id, shot_id)
+    keyframe = await _get_owned_keyframe(db, shot, keyframe_id)
+    if not keyframe.media_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="这一帧还没有图片，不能认可"
+        )
+    await approve(db, keyframe)
+    if shot.video_media_id is None:
+        shot.status = "prepared"
+    await db.commit()
+    await db.refresh(keyframe)
+    return await serialize_keyframe(db, keyframe)
+
+
+@router.post("/{shot_id}/keyframes/{keyframe_id}/review", response_model=ShotKeyframeRead)
+async def review_keyframe_route(
+    shot_id: int,
+    keyframe_id: int,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> ShotKeyframeRead:
+    """对这张关键帧做一次 AI 视觉初审。
+
+    只写审查结论，不改变「认可」状态，也不影响任何生成流程；
+    前端用它给「按建议重绘」预填增量描述。
+    """
+    from app.services.agents.visual_qa import review_keyframe
+    from app.services.providers.base import ProviderError
+
+    shot = await _get_owned_shot(db, user.id, shot_id)
+    keyframe = await _get_owned_keyframe(db, shot, keyframe_id)
+    if not keyframe.media_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="这一帧还没有图片，无法审查"
+        )
+    asset = await db.get(MediaAsset, int(keyframe.media_id))
+    if not asset:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="关键帧素材不存在")
+    try:
+        await review_keyframe(db, user_id=user.id, asset=asset, shot=shot)
+    except ProviderError as exc:
+        code = (
+            status.HTTP_400_BAD_REQUEST
+            if "未找到" in str(exc)
+            else status.HTTP_502_BAD_GATEWAY
+        )
+        raise HTTPException(status_code=code, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    await db.commit()
+    return await serialize_keyframe(db, keyframe)
+
+
+@router.post("/{shot_id}/continuity")
+async def review_shot_continuity(
+    shot_id: int,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """重跑本镜「与上一镜之间」的切点审查：只出报告，不改认可状态、不影响导出。"""
+    from app.services.agents.continuity import previous_shot, review_cut
+    from app.services.providers.base import ProviderError
+
+    shot = await _get_owned_shot(db, user.id, shot_id)
+    prev = await previous_shot(db, shot)
+    if prev is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="这是第一个镜头，没有可比的切点"
+        )
+    try:
+        report = await review_cut(
+            db, user_id=user.id, prev_shot=prev, shot=shot, force=True
+        )
+    except ProviderError as exc:
+        code = (
+            status.HTTP_400_BAD_REQUEST
+            if "缺少可用视频" in str(exc) or "未检测到 ffmpeg" in str(exc)
+            else status.HTTP_502_BAD_GATEWAY
+        )
+        raise HTTPException(status_code=code, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    await db.commit()
+    return report or {}
 
 
 @router.delete(
@@ -276,6 +381,7 @@ async def generate_shot_image(
     """生成关键帧：不传 keyframe_id 时新增一张，传了则重绘该张。"""
     shot = await _get_owned_shot(db, user.id, shot_id)
     keyframe_id = await _resolve_keyframe_target(db, user, shot, payload.keyframe_id)
+    project_id = await _project_id_of_shot(db, shot)
     params = {
         "shot_id": shot.id,
         "credential_id": payload.credential_id,
@@ -288,22 +394,42 @@ async def generate_shot_image(
         "keyframe_id": keyframe_id,
         "keyframe_label": payload.keyframe_label,
         "keyframe_prompts": payload.keyframe_prompts,
+        "append": payload.append,
         "asset_ids": payload.asset_ids,
         "negative_prompt": payload.negative_prompt,
         "template_id": payload.template_id,
         "template_variables": payload.template_variables,
     }
+    # 【先有脸，再有帧】出场角色还没定妆照时，先把定妆照任务排进链里；
+    # 关键帧必须等它完成后再生成，否则这一帧只能靠文字描述，人物必然不像本人。
+    sheet_tasks = await ensure_shot_cast_references(
+        db,
+        user_id=user.id,
+        project_id=project_id,
+        shot=shot,
+        asset_ids=payload.asset_ids,
+        aspect_ratio=payload.aspect_ratio,
+        provider=payload.provider,
+        model=payload.model,
+        credential_id=payload.credential_id,
+    )
     task = await create_task(
         db,
         user_id=user.id,
         kind="image",
         provider=payload.provider,
         model=payload.model,
-        project_id=await _project_id_of_shot(db, shot),
+        project_id=project_id,
         episode_id=shot.episode_id,
         shot_id=shot.id,
         params=params,
+        enqueue=not sheet_tasks,
     )
+    if sheet_tasks:
+        from app.services.pipeline import _start_chain
+
+        await _start_chain(db, sheet_tasks + [task])
+        await db.refresh(task)
     return TaskRead.model_validate(task)
 
 

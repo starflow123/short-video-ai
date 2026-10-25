@@ -7,7 +7,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import decrypt_secret
@@ -80,6 +80,7 @@ async def _spawn_asset_reference_tasks(
     aspect_ratio: str | None = None,
     provider: str | None = None,
     model: str | None = None,
+    credential_id: int | None = None,
 ) -> list[GenerationTask]:
     """给还没有参考图的角色 / 道具各建一张参考图任务（只落库，投递由调用方决定）。
 
@@ -97,7 +98,7 @@ async def _spawn_asset_reference_tasks(
     if not pending:
         return []
     try:
-        await resolve_credential(session, user_id, "image", None, None)
+        await resolve_credential(session, user_id, "image", credential_id, provider)
     except ProviderError:
         logger.info("未配置可用图片凭证，跳过资产参考图自动生成")
         return []
@@ -129,6 +130,7 @@ async def _spawn_asset_reference_tasks(
                 enqueue=False,
                 params={
                     "asset_id": asset.id,
+                    "credential_id": credential_id,
                     "prompt": prompt,
                     "negative_prompt": negative,
                     "aspect_ratio": aspect_ratio,
@@ -140,50 +142,46 @@ async def _spawn_asset_reference_tasks(
     return tasks
 
 
-async def _spawn_shot_keyframe_tasks(
+async def ensure_shot_cast_references(
     session: AsyncSession,
     *,
     user_id: int,
     project_id: int | None,
-    episode_id: int,
-    shots: list[Shot],
+    shot: Shot,
+    asset_ids: list | None = None,
+    aspect_ratio: str | None = None,
+    provider: str | None = None,
+    model: str | None = None,
+    credential_id: int | None = None,
 ) -> list[GenerationTask]:
-    """拆解完成后给每个镜头建一张起始关键帧任务（只落库，投递由调用方决定）。
-
-    与「批量生图」共用同一个 ``_handle_image``，但不受 ``prompt_confirmed`` 约束：
-    自动生图是给用户看效果用的，确认提示词仍然由用户在每个镜头上单独点。
-    """
-    from app.services.dispatch import create_task
-
-    targets = [shot for shot in shots if (shot.image_prompt or shot.description or "").strip()]
-    if not targets:
+    """给本镜头出场但还没有定妆照的角色 / 道具补任务，关键帧必须排在它们之后。"""
+    loaded = await _load_shot_assets(session, user_id, shot=shot, asset_ids=asset_ids)
+    pending_ids = [
+        int(item["id"])
+        for item in loaded
+        if item.get("kind") in ("actor", "prop")
+        and not item.get("media_id")
+        and item.get("id") is not None
+    ]
+    if not pending_ids:
         return []
-    try:
-        await resolve_credential(session, user_id, "image", None, None)
-    except ProviderError:
-        logger.info("未配置可用图片凭证，跳过分镜关键帧自动生成")
-        return []
-
-    tasks: list[GenerationTask] = []
-    for shot in targets:
-        tasks.append(
-            await create_task(
-                session,
-                user_id=user_id,
-                kind="image",
-                project_id=project_id,
-                episode_id=episode_id,
-                shot_id=shot.id,
-                enqueue=False,
-                params={
-                    "shot_id": shot.id,
-                    "prompt": shot.image_prompt,
-                    "n": 1,
-                    "flow": "auto_keyframe",
-                },
+    rows = list(
+        (
+            await session.execute(
+                select(ProductionAsset).where(ProductionAsset.id.in_(pending_ids))
             )
-        )
-    return tasks
+        ).scalars().all()
+    )
+    return await _spawn_asset_reference_tasks(
+        session,
+        user_id=user_id,
+        project_id=project_id,
+        assets=rows,
+        aspect_ratio=aspect_ratio,
+        provider=provider,
+        model=model,
+        credential_id=credential_id,
+    )
 
 
 def _as_float(value: Any) -> float | None:
@@ -224,6 +222,7 @@ def _normalize_resolution(value: Any) -> str | None:
 # 文本仍默认走 DeepSeek（长文本 / JSON 结构化更稳）。用户显式指定凭证或厂商时不受此影响。
 PREFERRED_PROVIDERS: dict[str, tuple[str, ...]] = {
     "text": ("deepseek", "agnes"),
+    "vision": ("deepseek",),
     "image": ("agnes", "magichour"),
     "video": ("agnes", "magichour"),
 }
@@ -479,6 +478,7 @@ async def _load_assets(
             "prompt": item.prompt,
             "description": item.description,
             "appearance": _appearance_lock(item),
+            "media_id": item.media_id,
             "reference_url": urls.get(item.media_id) if item.media_id else None,
             # 参考图已生成但拿不到公网地址（本地部署没配 PUBLIC_MEDIA_BASE_URL）：
             # 送不进模型，需要给用户明确提示，而不是静默当没有。
@@ -517,6 +517,8 @@ async def _load_shot_assets(
 
         # 旧分镜 / 手工分镜可能只有姓名没有 asset_id：按项目内同名资产兜底解析，
         # 同时按 start_state.location 找匹配的场景资产。
+        # 共享演员（is_global / project_id 为空）也要参与匹配，否则跨项目复用的角色
+        # 在分镜里只有姓名时拿不到定妆照，关键帧就会退化成纯文生图。
         episode = await session.get(Episode, shot.episode_id)
         project_id = episode.project_id if episode else None
         if project_id:
@@ -524,7 +526,10 @@ async def _load_shot_assets(
                 await session.execute(
                     select(ProductionAsset).where(
                         ProductionAsset.user_id == user_id,
-                        ProductionAsset.project_id == project_id,
+                        or_(
+                            ProductionAsset.project_id == project_id,
+                            ProductionAsset.is_global.is_(True),
+                        ),
                     )
                 )
             ).scalars().all()
@@ -1541,11 +1546,10 @@ async def _handle_text(session: AsyncSession, task: GenerationTask) -> dict[str,
             else {}
         )
 
-        # 【顺带出图】定妆照必须排在关键帧之前：关键帧要靠角色的参考图锁脸，
-        # 先出定妆照再出关键帧，用户确认提示词时看到的就是「像本人」的画面。
+        # 【先出脸，关键帧逐镜确认】自动生图只做到定妆照：定妆照不对时重抽成本低，
+        # 关键帧则必须逐镜生成、逐镜认可，否则一张错帧会让整批图返工。
         auto_tasks: list[GenerationTask] = []
         sheet_count = 0
-        keyframe_count = 0
         if params.get("auto_images") and project:
             sheet_tasks = await _spawn_asset_reference_tasks(
                 session,
@@ -1555,17 +1559,12 @@ async def _handle_text(session: AsyncSession, task: GenerationTask) -> dict[str,
                     session, user_id=task.user_id, project_id=project.id
                 ),
                 aspect_ratio=project.aspect_ratio,
+                credential_id=params.get("credential_id"),
+                provider=params.get("provider"),
+                model=params.get("model"),
             )
-            keyframe_tasks = await _spawn_shot_keyframe_tasks(
-                session,
-                user_id=task.user_id,
-                project_id=project.id,
-                episode_id=episode.id,
-                shots=shots,
-            )
-            auto_tasks = sheet_tasks + keyframe_tasks
+            auto_tasks = sheet_tasks
             sheet_count = len(sheet_tasks)
-            keyframe_count = len(keyframe_tasks)
             if auto_tasks:
                 await pipeline_service._start_chain(session, auto_tasks)
 
@@ -1580,7 +1579,7 @@ async def _handle_text(session: AsyncSession, task: GenerationTask) -> dict[str,
             "plan": episode.plan,
             "assets_bound": binding,
             "reference_tasks": sheet_count,
-            "keyframe_tasks": keyframe_count,
+            "keyframe_tasks": 0,
             "auto_image_tasks": len(auto_tasks),
         }
 
@@ -1918,7 +1917,8 @@ async def _handle_image(session: AsyncSession, task: GenerationTask) -> dict[str
 
     # 单张、且没指定要重绘哪一张 = 这一张要替换该镜头现有的画面（改完提示词重出、流水线重跑这批镜头）。
     # 此时不能再拿本镜头那张旧图当参考、还写「必须与上一张保持一致」——那等于逼模型复刻有缺陷的画面。
-    replaces_frame = is_new_keyframe and want_n == 1
+    # ``append`` = 用户明确要「生成下一张」：新增一张并承接上一张的结尾状态，不替换现有画面。
+    replaces_frame = is_new_keyframe and want_n == 1 and not params.get("append")
 
     if not credentials:
         raise ProviderError("图片生成失败：未配置可用的图片凭证")
@@ -1939,6 +1939,9 @@ async def _handle_image(session: AsyncSession, task: GenerationTask) -> dict[str
     # 没有上一帧时，多人镜头不送定妆照（纯文生图更听话），单人镜头才送一张锁脸。
     # 道具 / 场景参考图不影响人物数量，始终保留。用户显式勾选的资产不被过滤。
     empty_shot = shot is not None and not _named_subject_set(shot)
+    # 「生成下一张」且已有上一张时，唯一该送的参考就是本镜头上一张（链式承接在后面拼）；
+    # 再叠上一镜的连续性参考会变成两张构图模板，模型容易照抄站位。
+    append_mode = bool(params.get("append")) and bool(existing_kfs) and not params.get("asset_ids")
     if shot and supports_reference and not params.get("asset_ids"):
         previous = await _previous_shot_reference(session, shot)
         non_actor = [item for item in references if item.get("kind") != "actor"]
@@ -1947,7 +1950,9 @@ async def _handle_image(session: AsyncSession, task: GenerationTask) -> dict[str
         ]
         actor_refs = [item for item in references if item.get("kind") == "actor"]
         subject_count = len(_named_subject_set(shot))
-        if previous is not None:
+        if append_mode:
+            references = []
+        elif previous is not None:
             # 同一场戏同一组人的上一帧，比多张定妆照更能锁住脸、服装、场景与光线；
             # 只送这一张，避免定妆照/道具产品图被模型当成第二个构图模板。
             references = [previous]
@@ -1958,15 +1963,14 @@ async def _handle_image(session: AsyncSession, task: GenerationTask) -> dict[str
             # 背影镜头看不到脸，定妆照唯一的作用是让模型照着参考图再复制一个人
             references = []
         else:
-            # 群像定妆照（一张图里好几个人）送进 i2i 会被当成构图模板复制人数，默认不送。
-            # 例外：镜头里只有一名非群像角色（教师 + 满教室学生）时，只送他这一张——
-            # 他的体型设定（如异常鼓胀的腹部）只有图生图能锁住，纯文生图会按常规身材重画。
+            # 【多人镜头 · 多参考 + 防分身】没有上一帧时，按角色各送一张单人定妆照，
+            # 让模型分别锁定每张脸；群像定妆照仍不送（一张图里好几个人，会被当成构图
+            # 模板按人数复制）。图例与【人数硬约束】会同时声明「参考图张数≠画面人数」。
             solo_actor_refs = [item for item in actor_refs if not item.get("group")]
             group_in_cast = any(item.get("group") for item in actor_refs)
-            solo_slots = subject_count - (1 if group_in_cast else 0)
-            if solo_slots == 1 and len(solo_actor_refs) == 1:
-                references = ([solo_actor_refs[0]] + object_refs)[:4]
-            elif not group_in_cast and subject_count == 1:
+            if solo_actor_refs:
+                references = (solo_actor_refs + object_refs)[:4]
+            elif not group_in_cast:
                 references = object_refs
             else:
                 references = []
@@ -2039,6 +2043,26 @@ async def _handle_image(session: AsyncSession, task: GenerationTask) -> dict[str
         if all(exist["url"] != item["url"] for exist in references):
             references.insert(0, item)
     references = references[:4]
+
+    # 【参考图体检】逐个人物核对「本帧到底有没有脸可锁」：
+    # 没建档 / 定妆照没出 / 图拿不到公网地址，都会让该角色退回纯文字描述，
+    # 这正是「关键帧不像本人」的根因。结果随关键帧一起存下来并在前端展示。
+    reference_issues: list[str] = []
+    has_continuity_ref = append_mode or any(
+        item.get("kind") == "continuity" for item in references
+    )
+    if shot is not None and supports_reference and not has_continuity_ref:
+        actor_assets = [item for item in assets if item.get("kind") == "actor"]
+        for name in sorted(_named_subject_set(shot)):
+            match = next(
+                (item for item in actor_assets if _same_name(item.get("name"), name)), None
+            )
+            if match is None:
+                reference_issues.append(f"{name}：没有角色档案，无法锁脸")
+            elif not match.get("media_id"):
+                reference_issues.append(f"{name}：定妆照还没生成，无法锁脸")
+            elif not match.get("reference_url"):
+                reference_issues.append(f"{name}：参考图拿不到公网地址，送不进模型")
 
     # 本次是「改设定」而不是「重画」时，明确告诉模型保持五官、只改服装
     identity_extra: str | None = None
@@ -2134,6 +2158,14 @@ async def _handle_image(session: AsyncSession, task: GenerationTask) -> dict[str
                 "为避免覆盖资产现有参考图，本次结果已丢弃，请稍后重试。"
             )
         task.model = result.meta.get("model") or task.model
+        used_this_round = (
+            bool((result.meta or {}).get("reference_used", True)) if round_references else None
+        )
+        reference_warning = None
+        if round_references and not used_this_round:
+            reference_warning = (
+                "参考图队列繁忙，本次已降级为纯文生图，人物/道具一致性可能下降；建议稍后重绘该帧。"
+            )
         asset = await storage.persist_media(
             session,
             user_id=task.user_id,
@@ -2159,11 +2191,15 @@ async def _handle_image(session: AsyncSession, task: GenerationTask) -> dict[str
                     {"kind": item.get("kind"), "name": item.get("name")}
                     for item in round_references
                 ],
+                "reference_count": len(round_references),
+                "reference_used": used_this_round,
+                "reference_warning": reference_warning,
+                "reference_issues": reference_issues,
             },
         )
         created_assets.append(asset)
         prev_clean = round_base
-        if round_references and bool((result.meta or {}).get("reference_used", True)):
+        if used_this_round:
             used_any_reference = True
         # 同一批多张时，下一张以这一张为链式参考；重绘指定关键帧不改变后续基准
         if is_new_keyframe and supports_reference:
@@ -2186,7 +2222,10 @@ async def _handle_image(session: AsyncSession, task: GenerationTask) -> dict[str
                 label=(params.get("keyframe_label") if want_n == 1 else auto_label),
                 # 单张出图且没指定要重绘哪张 = 这一张就是要替换该镜头当前的画面，必须接管主帧；
                 # 多张（起幅/中段/落幅）是同一镜头的推进序列，首帧仍是主帧，不能改。
-                promote_primary=(want_n == 1 and not params.get("keyframe_id")),
+                # 「生成下一张」也不接管主帧：主帧停留在用户已认可的那一张。
+                promote_primary=(
+                    want_n == 1 and not params.get("keyframe_id") and not params.get("append")
+                ),
             )
 
     if not created_assets:
@@ -2201,13 +2240,36 @@ async def _handle_image(session: AsyncSession, task: GenerationTask) -> dict[str
         "urls": [a.url for a in created_assets],
         "count": len(created_assets),
     }
+
+    # 【AI 初审】单张关键帧出图后顺带做一次读图审查（只给建议，绝不自动认可）；
+    # 多张批次（起幅/中段/落幅）不逐张调，避免一次生图产生多笔视觉调用。
+    # 审查失败只记日志，不影响生图任务本身。
+    if shot is not None and not is_asset_sheet and len(created_assets) == 1:
+        from app.services.agents.visual_qa import maybe_review_keyframe
+
+        review = await maybe_review_keyframe(
+            session, user_id=task.user_id, asset=first, shot=shot
+        )
+        if review:
+            payload["visual_review"] = review
+
     if references or chain_reference:
         payload["reference_used"] = used_any_reference
+        payload["reference_count"] = len(references) + (1 if chain_reference else 0)
+        payload["reference_roles"] = [
+            {"kind": item.get("kind"), "name": item.get("name")} for item in references
+        ]
+        if chain_reference:
+            payload["reference_roles"].append(
+                {"kind": chain_reference.get("kind"), "name": chain_reference.get("name")}
+            )
         if not used_any_reference:
             payload["warning"] = (
                 "参考图队列繁忙，本次已降级为纯文生图，角色/道具一致性可能下降；"
                 "建议稍后重试该镜头。"
             )
+    if reference_issues:
+        payload["reference_issues"] = reference_issues
 
     # 参考图已生成但送不出去（本地部署未配置 PUBLIC_MEDIA_BASE_URL）时给明确提示，
     # 否则用户只会看到「人物又变了」却查不到原因。
@@ -2436,7 +2498,17 @@ async def _handle_video(session: AsyncSession, task: GenerationTask) -> dict[str
 
 
 async def _handle_export(session: AsyncSession, task: GenerationTask) -> dict[str, Any]:
+    # 切点审查先跑：dry-run 只出报告，任何失败都不阻断导出
+    continuity = None
+    if task.project_id:
+        from app.services.agents.continuity import maybe_review_project
+
+        continuity = await maybe_review_project(
+            session, user_id=task.user_id, project_id=task.project_id
+        )
     result = await export_service.export_project(session, task)
+    if continuity is not None:
+        result["continuity"] = continuity
     if task.episode_id:
         episode = await session.get(Episode, int(task.episode_id))
         if episode:

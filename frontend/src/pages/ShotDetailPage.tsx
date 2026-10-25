@@ -12,6 +12,7 @@ import {
   InputNumber,
   Modal,
   Popconfirm,
+  Popover,
   Progress,
   Row,
   Select,
@@ -30,6 +31,7 @@ import {
   PictureOutlined,
   PlusOutlined,
   ReloadOutlined,
+  RobotOutlined,
   SaveOutlined,
   StarFilled,
   StarOutlined,
@@ -78,6 +80,38 @@ const KEYFRAME_PRESETS = [
 function composePrompt(base: string, hint: string) {
   return base ? `${base}。${hint}` : hint
 }
+
+/** AI 初审的检查项与结论文案：模型原样返回 key，前端负责翻译成可读标签。 */
+const REVIEW_CHECKS: { key: string; label: string }[] = [
+  { key: 'face_match', label: '像不像本人' },
+  { key: 'costume_match', label: '服装一致' },
+  { key: 'cast_count', label: '出场人数' },
+  { key: 'prop_holder', label: '道具归属' },
+  { key: 'duplicate_person', label: '有无分身' },
+  { key: 'composition', label: '构图景别' },
+]
+
+const REVIEW_VERDICT: Record<string, { text: string; color: string }> = {
+  pass: { text: '通过', color: 'green' },
+  warn: { text: '有风险', color: 'orange' },
+  fail: { text: '不通过', color: 'red' },
+}
+
+const REVIEW_CHECK_STATUS: Record<string, { text: string; color: string }> = {
+  pass: { text: '通过', color: 'green' },
+  warn: { text: '注意', color: 'orange' },
+  fail: { text: '不通过', color: 'red' },
+  unknown: { text: '看不清', color: 'default' },
+}
+
+/** 切点审查的检查项：只比人 / 服装 / 场景 / 光线与首帧，姿态突变不算问题。 */
+const CONTINUITY_CHECKS: { key: string; label: string }[] = [
+  { key: 'same_person', label: '是不是同一人' },
+  { key: 'costume_continuity', label: '服装发型' },
+  { key: 'scene_continuity', label: '场景连续' },
+  { key: 'lighting_continuity', label: '光线色温' },
+  { key: 'keyframe_match', label: '首帧贴合认可帧' },
+]
 
 const RESOLUTIONS = ['720p', '1080p']
 
@@ -181,6 +215,7 @@ export default function ShotDetailPage() {
     label?: string
     prompt?: string
     batch: boolean
+    append?: boolean
     batchPrompts?: Record<string, string>
     asset_ids?: number[]
     negative_prompt?: string
@@ -204,6 +239,9 @@ export default function ShotDetailPage() {
   const [assets, setAssets] = useState<ProductionAsset[]>([])
   const [project, setProject] = useState<Project | null>(null)
   const [confirming, setConfirming] = useState(false)
+  const [approveBusyId, setApproveBusyId] = useState<number | null>(null)
+  const [reviewBusyId, setReviewBusyId] = useState<number | null>(null)
+  const [continuityBusy, setContinuityBusy] = useState(false)
 
   // 结构化镜头上下文：AI 拆解产出的事实（谁拿什么、几秒做什么），可在这里就地纠正。
   // 生成时按它选参考图、拼主体绑定与时间轴，所以改完不必重跑整集拆解。
@@ -241,6 +279,7 @@ export default function ShotDetailPage() {
   }, [keyframes])
 
   const status = shot ? SHOT_STATUS[shot.status] ?? { text: shot.status, color: 'default' } : null
+  const continuity = shot?.continuity_review ?? null
 
   const load = useCallback(async () => {
     try {
@@ -555,15 +594,18 @@ export default function ShotDetailPage() {
   }
 
   // ---------------- 关键帧 ----------------
-  const openKeyframeModal = (target?: ShotKeyframe) => {
+  const openKeyframeModal = (target?: ShotKeyframe, append = false, patch?: string) => {
     kfForm.resetFields()
     const base = target?.prompt ?? shot?.image_prompt ?? shot?.description ?? ''
+    // AI 初审的修正建议只追加到基础描述后面，不覆盖镜头的人数 / 服装 / 道具硬约束
+    const prompt = patch ? composePrompt(base, patch) : base
     kfForm.setFieldsValue({
       target: target?.id ?? 'new',
       label: target?.label ?? '',
-      prompt: base,
+      prompt,
       style: undefined,
       batch: false,
+      append: target ? false : append,
       // 每张关键帧预填各自的构图提示，让三张默认就不一样，且都能单独改
       batchPrompts: target
         ? undefined
@@ -617,6 +659,7 @@ export default function ShotDetailPage() {
           prompt: applyStyleKeyword(base, values.style) || undefined,
           keyframe_id: targetId,
           keyframe_label: values.label || undefined,
+          append: targetId ? false : Boolean(values.append),
           asset_ids: values.asset_ids?.length ? values.asset_ids : undefined,
           negative_prompt: values.negative_prompt?.trim() ? values.negative_prompt : undefined,
         })
@@ -638,6 +681,51 @@ export default function ShotDetailPage() {
       await load()
     } catch (error) {
       message.error(describeError(error))
+    }
+  }
+
+  /** 认可这一帧：批量生视频只会使用已认可的帧；重绘后认可自动失效。 */
+  const approveFrame = async (keyframe: ShotKeyframe) => {
+    if (!shot) return
+    setApproveBusyId(keyframe.id)
+    try {
+      await shotApi.approveKeyframe(shot.id, keyframe.id)
+      message.success('已认可这一帧，批量生视频将以它为固定首帧')
+      await load()
+    } catch (error) {
+      message.error(describeError(error))
+    } finally {
+      setApproveBusyId(null)
+    }
+  }
+
+  /** AI 初审：只写检查结论与重绘建议，不会代替你点「认可」。 */
+  const reviewFrame = async (keyframe: ShotKeyframe) => {
+    if (!shot) return
+    setReviewBusyId(keyframe.id)
+    try {
+      await shotApi.reviewKeyframe(shot.id, keyframe.id)
+      message.success('AI 初审完成，结论仅供参考；认可仍由你决定')
+      await load()
+    } catch (error) {
+      message.error(describeError(error))
+    } finally {
+      setReviewBusyId(null)
+    }
+  }
+
+  /** 切点审查：只比对上一镜尾帧与本镜首帧，出报告；是否重跑镜头由你决定。 */
+  const reviewContinuity = async () => {
+    if (!shot) return
+    setContinuityBusy(true)
+    try {
+      await shotApi.reviewContinuity(shot.id)
+      message.success('切点审查完成，结论仅供参考')
+      await load()
+    } catch (error) {
+      message.error(describeError(error))
+    } finally {
+      setContinuityBusy(false)
     }
   }
 
@@ -752,6 +840,11 @@ export default function ShotDetailPage() {
           <Button icon={<PictureOutlined />} onClick={() => openKeyframeModal()}>
             生成关键帧
           </Button>
+          <Tooltip title="新增一张并承接上一张的结尾状态；不替换当前主帧，满意后再点「认可」">
+            <Button icon={<PlusOutlined />} onClick={() => openKeyframeModal(undefined, true)}>
+              生成下一张
+            </Button>
+          </Tooltip>
           <Button type="primary" icon={<VideoCameraAddOutlined />} onClick={openVideoModal}>
             生成视频
           </Button>
@@ -786,8 +879,23 @@ export default function ShotDetailPage() {
               />
             ) : (
               <div className="kf-grid">
-                {keyframes.map((keyframe) => (
-                  <div className={`kf-card${keyframe.is_primary ? ' kf-card-primary' : ''}`} key={keyframe.id}>
+                {keyframes.map((keyframe) => {
+                  const review = keyframe.visual_review
+                  const riskCount = review
+                    ? Object.values(review.checks ?? {}).filter(
+                        (value) => value === 'warn' || value === 'fail',
+                      ).length
+                    : 0
+                  const verdict = review
+                    ? REVIEW_VERDICT[review.verdict] ?? REVIEW_VERDICT.warn
+                    : null
+                  return (
+                  <div
+                    className={`kf-card${keyframe.is_primary ? ' kf-card-primary' : ''}${
+                      keyframe.approved_at ? ' kf-card-approved' : ''
+                    }`}
+                    key={keyframe.id}
+                  >
                     <div className="kf-thumb">
                       {keyframe.url ? (
                         <img src={mediaUrl(keyframe.url)} alt={keyframe.label ?? ''} loading="lazy" />
@@ -801,12 +909,47 @@ export default function ShotDetailPage() {
                           <StarFilled /> 主帧
                         </span>
                       )}
+                      {keyframe.approved_at && (
+                        <span
+                          className="kf-badge"
+                          style={{ left: 'auto', right: 6, background: 'rgba(35, 160, 90, 0.9)' }}
+                        >
+                          <CheckCircleOutlined /> 已认可
+                        </span>
+                      )}
                     </div>
                     <div className="kf-meta">
                       <Typography.Text ellipsis style={{ fontSize: 12.5, fontWeight: 600 }}>
                         {keyframe.label || `关键帧 ${keyframe.order_index}`}
                       </Typography.Text>
                       <Space size={2}>
+                        <Tooltip title="AI 初审：核对像不像本人、服装、人数、道具与分身（只给建议）">
+                          <Button
+                            size="small"
+                            type="text"
+                            loading={reviewBusyId === keyframe.id}
+                            disabled={!keyframe.media_id}
+                            icon={<RobotOutlined />}
+                            onClick={() => void reviewFrame(keyframe)}
+                          />
+                        </Tooltip>
+                        <Tooltip
+                          title={
+                            keyframe.approved_at
+                              ? '已认可；重绘后需要重新认可'
+                              : '认可这一帧：批量生视频只使用已认可的帧'
+                          }
+                        >
+                          <Button
+                            size="small"
+                            type="text"
+                            loading={approveBusyId === keyframe.id}
+                            disabled={!keyframe.media_id || Boolean(keyframe.approved_at)}
+                            icon={<CheckCircleOutlined />}
+                            style={keyframe.approved_at ? { color: '#23a05a' } : undefined}
+                            onClick={() => void approveFrame(keyframe)}
+                          />
+                        </Tooltip>
                         <Tooltip title={keyframe.url ? '重新生成这张' : '生成这张关键帧'}>
                           <Button
                             size="small"
@@ -852,6 +995,107 @@ export default function ShotDetailPage() {
                         </Popconfirm>
                       </Space>
                     </div>
+                    {(keyframe.reference_count > 0 || keyframe.reference_issues.length > 0) && (
+                      <Space size={4} wrap>
+                        {keyframe.reference_count > 0 && (
+                          <Tooltip
+                            title={
+                              keyframe.reference_roles
+                                .map((item) => `${item.kind === 'actor' ? '角色' : item.kind === 'prop' ? '道具' : '参考'}「${item.name ?? ''}」`)
+                                .join('；') || '已送参考图'
+                            }
+                          >
+                            <Tag
+                              color={keyframe.reference_used === false ? 'red' : 'blue'}
+                              bordered={false}
+                              style={{ margin: 0, fontSize: 11 }}
+                            >
+                              参考 {keyframe.reference_count} 张
+                              {keyframe.reference_used === false ? ' · 未送达' : ''}
+                            </Tag>
+                          </Tooltip>
+                        )}
+                        {keyframe.reference_issues.length > 0 && (
+                          <Tooltip title={keyframe.reference_issues.join('；')}>
+                            <Tag color="orange" bordered={false} style={{ margin: 0, fontSize: 11 }}>
+                              缺脸风险
+                            </Tag>
+                          </Tooltip>
+                        )}
+                      </Space>
+                    )}
+                    {keyframe.reference_warning && (
+                      <Typography.Text type="danger" style={{ fontSize: 11 }}>
+                        {keyframe.reference_warning}
+                      </Typography.Text>
+                    )}
+                    {review && verdict && (
+                      <Space size={4} wrap>
+                        <Popover
+                          title="AI 初审（只给建议，不代替你认可）"
+                          content={
+                            <div style={{ maxWidth: 320, fontSize: 12 }}>
+                              <Space size={4} wrap style={{ marginBottom: 6 }}>
+                                {REVIEW_CHECKS.map((check) => {
+                                  const status =
+                                    REVIEW_CHECK_STATUS[review.checks[check.key]] ??
+                                    REVIEW_CHECK_STATUS.unknown
+                                  return (
+                                    <Tag
+                                      key={check.key}
+                                      color={status.color}
+                                      bordered={false}
+                                      style={{ margin: 0, fontSize: 11 }}
+                                    >
+                                      {check.label}：{status.text}
+                                    </Tag>
+                                  )
+                                })}
+                              </Space>
+                              {review.reasons.length > 0 ? (
+                                <ul style={{ margin: 0, paddingLeft: 18 }}>
+                                  {review.reasons.map((reason) => (
+                                    <li key={reason}>{reason}</li>
+                                  ))}
+                                </ul>
+                              ) : (
+                                <Typography.Text type="secondary">
+                                  没有可确认的问题。
+                                </Typography.Text>
+                              )}
+                              {review.prompt_patch && (
+                                <Typography.Paragraph type="secondary" style={{ margin: '6px 0 0' }}>
+                                  重绘建议：{review.prompt_patch}
+                                </Typography.Paragraph>
+                              )}
+                              <Typography.Text type="secondary" style={{ fontSize: 11 }}>
+                                {review.model ? `${review.provider ?? ''} · ${review.model}` : ''}
+                              </Typography.Text>
+                            </div>
+                          }
+                        >
+                          <Tag
+                            color={verdict.color}
+                            bordered={false}
+                            icon={<RobotOutlined />}
+                            style={{ margin: 0, fontSize: 11, cursor: 'pointer' }}
+                          >
+                            AI 初审：{verdict.text}
+                            {riskCount > 0 ? ` · ${riskCount} 项风险` : ''}
+                          </Tag>
+                        </Popover>
+                        {review.verdict !== 'pass' && review.prompt_patch && (
+                          <Button
+                            size="small"
+                            type="link"
+                            style={{ fontSize: 11, padding: 0 }}
+                            onClick={() => openKeyframeModal(keyframe, false, review.prompt_patch ?? undefined)}
+                          >
+                            按建议重绘
+                          </Button>
+                        )}
+                      </Space>
+                    )}
                     {keyframe.prompt && (
                       <Typography.Paragraph
                         type="secondary"
@@ -862,7 +1106,8 @@ export default function ShotDetailPage() {
                       </Typography.Paragraph>
                     )}
                   </div>
-                ))}
+                  )
+                })}
               </div>
             )}
           </Card>
@@ -909,6 +1154,85 @@ export default function ShotDetailPage() {
               {primaryKeyframe?.label ? `「${primaryKeyframe.label}」` : ''}
               作为首帧，也可在生成弹窗中改选。
             </Typography.Text>
+            {shot.video_url && (
+              <div style={{ marginTop: 10 }}>
+                <Space size={6} wrap>
+                  {continuity ? (
+                    <Popover
+                      trigger="click"
+                      placement="bottomLeft"
+                      title="切点审查明细（AI 建议）"
+                      content={
+                        <div style={{ width: 300 }}>
+                          {CONTINUITY_CHECKS.map((item) => {
+                            const state =
+                              REVIEW_CHECK_STATUS[continuity.checks[item.key]] ??
+                              REVIEW_CHECK_STATUS.unknown
+                            return (
+                              <div
+                                key={item.key}
+                                style={{
+                                  display: 'flex',
+                                  justifyContent: 'space-between',
+                                  marginBottom: 4,
+                                }}
+                              >
+                                <Typography.Text style={{ fontSize: 12.5 }}>
+                                  {item.label}
+                                </Typography.Text>
+                                <Tag color={state.color} style={{ marginInlineEnd: 0 }}>
+                                  {state.text}
+                                </Tag>
+                              </div>
+                            )
+                          })}
+                          {continuity.reasons.map((reason, index) => (
+                            <Typography.Paragraph
+                              key={index}
+                              style={{ fontSize: 12.5, margin: '4px 0 0' }}
+                            >
+                              · {reason}
+                            </Typography.Paragraph>
+                          ))}
+                          <Typography.Text type="secondary" style={{ fontSize: 11.5 }}>
+                            {continuity.model} · {continuity.reviewed_at?.replace('T', ' ').slice(0, 19)}
+                          </Typography.Text>
+                        </div>
+                      }
+                    >
+                      <Tag
+                        color={
+                          (REVIEW_VERDICT[continuity.verdict] ?? { color: 'default' }).color
+                        }
+                        style={{ cursor: 'pointer', margin: 0 }}
+                      >
+                        衔接：
+                        {(REVIEW_VERDICT[continuity.verdict] ?? { text: continuity.verdict }).text}{' '}
+                        <RobotOutlined />
+                      </Tag>
+                    </Popover>
+                  ) : (
+                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                      尚未审查与上一镜的衔接
+                    </Typography.Text>
+                  )}
+                  <Button
+                    size="small"
+                    icon={<RobotOutlined />}
+                    loading={continuityBusy}
+                    onClick={() => void reviewContinuity()}
+                  >
+                    {continuity ? '重跑切点审查' : '审查衔接'}
+                  </Button>
+                </Space>
+                <Typography.Text
+                  type="secondary"
+                  style={{ display: 'block', fontSize: 12, marginTop: 6 }}
+                >
+                  只比人 / 服装 / 场景 / 光线与认可首帧，姿态突变和景别切换不算问题；AI 只给建议，不阻断导出。
+                </Typography.Text>
+              </div>
+            )}
           </Card>
         </Col>
       </Row>
@@ -1670,6 +1994,14 @@ export default function ShotDetailPage() {
                       ]}
                     />
                   </Form.Item>
+                  <Form.Item
+                    name="append"
+                    valuePropName="checked"
+                    tooltip="勾选后这张会承接上一张的结尾状态，且不接管主帧；适合逐张推进、满意后再认可。新增空位重绘时无效。"
+                    style={{ marginBottom: 12 }}
+                  >
+                    <Checkbox>新增并承接上一张（不替换当前主帧）</Checkbox>
+                  </Form.Item>
                   <Form.Item name="label" label="标签（新增时使用）">
                     <Input placeholder="例如：起幅 / 特写 / 眼神" maxLength={100} />
                   </Form.Item>
@@ -1735,7 +2067,7 @@ export default function ShotDetailPage() {
                 .map((keyframe) => ({
                   value: keyframe.media_id as number,
                   label: `${keyframe.label ?? `关键帧 ${keyframe.order_index}`}${
-                    keyframe.is_primary ? '（主帧）' : ''
+                    keyframe.approved_at ? '（已认可）' : keyframe.is_primary ? '（主帧）' : ''
                   }`,
                 }))}
             />
@@ -1808,11 +2140,16 @@ export default function ShotDetailPage() {
               </Form.Item>
             </Col>
           </Row>
-          {keyframes.length === 0 && (
+          {keyframes.length === 0 ? (
             <Typography.Text type="warning" style={{ fontSize: 12 }}>
               该分镜还没有关键帧，将按「文生视频」执行；建议先生成关键帧。
             </Typography.Text>
-          )}
+          ) : !keyframes.some((keyframe) => keyframe.approved_at) ? (
+            <Typography.Text type="warning" style={{ fontSize: 12 }}>
+              还没有已认可的关键帧：单镜生成可直接用主帧，但「批量生视频」只消费已认可的帧，
+              建议先在关键帧卡片上点「认可」。
+            </Typography.Text>
+          ) : null}
         </Form>
       </Modal>
 

@@ -59,6 +59,8 @@ class GenerationRequest(BaseModel):
     # 图片任务：指定 keyframe_id 表示重绘某张已有关键帧；否则按 keyframe_label 新建一张。
     keyframe_id: int | None = None
     keyframe_label: str | None = None
+    # 追加模式：新增一张并承接上一张的结尾状态，不替换该镜头当前画面（逐镜确认的主路径）。
+    append: bool = False
     # 逐张关键帧提示词：n>1 批量生成时，第 i 张用 keyframe_prompts[i]，
     # 让「起幅 / 中段 / 落幅」各用各自的提示词，而不是共用同一句再叠加构图提示。
     keyframe_prompts: list[str] | None = None

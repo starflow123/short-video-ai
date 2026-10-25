@@ -564,6 +564,11 @@ body {
   border-color: var(--brand);
 }
 
+.kf-card-approved {
+  border-color: #23a05a;
+  box-shadow: 0 0 0 1px rgba(35, 160, 90, 0.18);
+}
+
 .kf-thumb {
   position: relative;
   aspect-ratio: 16 / 9;

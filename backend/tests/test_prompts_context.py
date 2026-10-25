@@ -149,6 +149,94 @@ def test_subject_block_marks_primary_first_and_forbids_swap():
     assert "不得把道具换给其他角色" in block
 
 
+def _worst_case_prompt(**overrides):
+    """真实上限：三人同框 + 三拍动作 + 三张参考图 + 道具/场景/衔接。"""
+    base = (
+        "深夜旧教学楼走廊，杨间站在走廊尽头，手里握着老式柴刀，身后的门缝里渗出暗红色的光。"
+        "他缓缓抬起刀，目光盯着从阴影里爬出来的黑影，呼吸压得很低。"
+    ) * 2
+    payload = {
+        "base": base,
+        "style": "现实悬疑短剧，冷色调，电影感",
+        "aspect_ratio": "9:16",
+        "assets": [
+            {"kind": "actor", "name": "杨间", "description": "二十岁男性，短发，左眼红色印记"},
+            {"kind": "actor", "name": "张伟", "description": "同龄男生，圆脸，校服外套"},
+            {"kind": "prop", "name": "老式柴刀", "description": "木柄铁刃"},
+            {"kind": "scene", "name": "旧教学楼走廊", "description": "斑驳墙面，暗红应急灯"},
+        ],
+        "subjects": [
+            {"name": "杨间", "position": "画面左侧三分之一，面向走廊深处", "action": "抬刀戒备",
+             "expression": "紧绷", "gaze": "看向阴影", "holds": "老式柴刀", "is_primary": True},
+            {"name": "张伟", "position": "画面右侧，半蹲在门边", "action": "扶住门框",
+             "expression": "惊恐", "gaze": "看向黑影"},
+            {"name": "黑影", "position": "走廊中央", "action": "贴着墙爬行",
+             "expression": "无", "gaze": "看向杨间"},
+        ],
+        "props": [{"name": "老式柴刀", "owner": "杨间", "state": "刀刃朝外"}],
+        "timeline": [
+            {"start": 0, "end": 2.5, "action": "杨间抬刀，张伟后退半步", "camera": "缓慢推进"},
+            {"start": 2.5, "end": 5, "action": "黑影从门缝挤出，杨间横刀", "camera": "轻微手持"},
+            {"start": 5, "end": 8, "action": "刀光闪过，画面定格", "camera": "定格"},
+        ],
+        "duration": 8,
+        "start_state": {"location": "旧教学楼走廊", "time_of_day": "深夜", "light": "暗红应急灯"},
+        "end_state": {"positions": "两人并肩"},
+        "directives": {"shot_size": "中全景", "camera_angle": "低角度",
+                       "camera_movement": "缓慢推进", "atmosphere": "压抑惊悚"},
+        "references": [
+            {"kind": "actor", "name": "杨间", "purpose": "定妆"},
+            {"kind": "actor", "name": "张伟", "purpose": "定妆"},
+            {"kind": "prop", "name": "老式柴刀", "purpose": "道具"},
+        ],
+        "continuity": "上一镜两人在走廊入口，本镜推进到尽头；服装、光线与色调保持一致。",
+        "with_breakdown": True,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_prompt_budgets_keep_every_critical_block():
+    image, image_blocks = prompts.compose_generation_prompt(
+        kind="image", max_chars=prompts.MAX_IMAGE_PROMPT_CHARS, **_worst_case_prompt()
+    )
+    video, video_blocks = prompts.compose_generation_prompt(
+        kind="video", max_chars=prompts.MAX_VIDEO_PROMPT_CHARS, **_worst_case_prompt()
+    )
+
+    assert len(image) <= prompts.MAX_IMAGE_PROMPT_CHARS
+    assert len(video) <= prompts.MAX_VIDEO_PROMPT_CHARS
+    # 预算再紧，人数 / 参考对应 / 质量底线 / 负面词一层都不能整块消失
+    for text in (image, video):
+        for marker in (
+            "【人数",
+            "【参考图对应关系",
+            "【负面提示",
+            "【风格收束】",
+        ):
+            assert marker in text
+    assert "【画面质量与细节要求】" in image
+    assert "【视频质量与连续性要求】" in video
+    assert "【本帧定格时刻】" in image
+    assert "【动作时间轴" in video
+    dropped_image = [item["tag"] for item in image_blocks if item["chars"] == 0]
+    dropped_video = [item["tag"] for item in video_blocks if item["chars"] == 0]
+    assert dropped_image == []
+    assert dropped_video == []
+
+
+def test_multi_person_rule_counts_references_not_people():
+    block = prompts.build_reference_legend(
+        [
+            {"kind": "actor", "name": "杨间"},
+            {"kind": "actor", "name": "张伟"},
+        ],
+        lean=True,
+    )
+    assert "参考图张数≠画面人数" in block
+    assert "不画分身" in block
+
+
 _ASSETS = [
     {"id": 1, "kind": "actor", "name": "杨间", "reference_url": "https://x/yang.png"},
     {"id": 2, "kind": "actor", "name": "林默", "reference_url": "https://x/lin.png"},

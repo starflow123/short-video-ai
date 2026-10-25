@@ -4,6 +4,7 @@ import type {
   AssetPayload,
   BreakdownPayload,
   ConnectionTestResult,
+  ContinuityReview,
   Credential,
   CredentialPayload,
   EditCreatePayload,
@@ -17,6 +18,7 @@ import type {
   PipelineConfirmPayload,
   PipelineRun,
   PipelineStartPayload,
+  PipelineVideoPayload,
   Project,
   ProjectPayload,
   ProjectSuggestion,
@@ -120,8 +122,21 @@ export const shotApi = {
     http.post<ShotKeyframe>(`/shots/${id}/keyframes`, data).then((r) => r.data),
   updateKeyframe: (id: number, keyframeId: number, data: KeyframePayload) =>
     http.patch<ShotKeyframe>(`/shots/${id}/keyframes/${keyframeId}`, data).then((r) => r.data),
+  /** 认可这一帧：成为该镜头唯一已认可的帧，并自动设为主帧（重绘后自动失效） */
+  approveKeyframe: (id: number, keyframeId: number) =>
+    http
+      .post<ShotKeyframe>(`/shots/${id}/keyframes/${keyframeId}/approve`)
+      .then((r) => r.data),
+  /** AI 视觉初审：只写结论与重绘建议，不改变「认可」状态 */
+  reviewKeyframe: (id: number, keyframeId: number) =>
+    http
+      .post<ShotKeyframe>(`/shots/${id}/keyframes/${keyframeId}/review`)
+      .then((r) => r.data),
   removeKeyframe: (id: number, keyframeId: number) =>
     http.delete(`/shots/${id}/keyframes/${keyframeId}`).then((r) => r.data),
+  /** 切点审查：重跑本镜与上一镜之间的衔接检查，只出报告、不影响导出 */
+  reviewContinuity: (id: number) =>
+    http.post<ContinuityReview>(`/shots/${id}/continuity`).then((r) => r.data),
 }
 
 // ------------------------------ 任务 ------------------------------
@@ -228,4 +243,7 @@ export const pipelineApi = {
   /** 确认提示词后批量生图；传 shot_ids 即只重跑这些镜头 */
   confirm: (runId: number, data: PipelineConfirmPayload) =>
     http.post<PipelineRun>(`/pipeline/runs/${runId}/confirm`, data).then((r) => r.data),
+  /** 批量生视频：只消费已人工认可的关键帧；全部齐了自动导出成片 */
+  videos: (runId: number, data: PipelineVideoPayload) =>
+    http.post<PipelineRun>(`/pipeline/runs/${runId}/videos`, data).then((r) => r.data),
 }

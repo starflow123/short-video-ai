@@ -329,10 +329,11 @@ async def _batch_generate_images(state: PipelineState) -> dict[str, Any]:
 
 
 async def _batch_generate_videos(state: PipelineState) -> dict[str, Any]:
-    """第五步：为已有关键帧的镜头批量生视频，全部完成后自动拼成片。
+    """第五步：为已认可的关键帧批量生视频，全部完成后自动拼成片。
 
-    - 显式传 ``video_shot_ids``：只重跑这些镜头（即使已有视频）；
-    - 不传：默认补齐该项目里「有关键帧但还没有视频」的所有镜头。
+    - 显式传 ``video_shot_ids``：只重跑这些镜头（即使已有视频；用于用户主动返工）；
+    - 不传：只补齐「关键帧已人工认可、还没有视频」的镜头，避免把未经确认的画面
+      直接做成片。认可标记在重绘后自动失效。
     """
     from app.services.dispatch import create_task
 
@@ -356,29 +357,46 @@ async def _batch_generate_videos(state: PipelineState) -> dict[str, Any]:
             raise ProviderError("该分集还没有分镜，请先出分镜并生图")
 
         wanted = params.get("video_shot_ids")
-        if wanted:
+        explicit = bool(wanted)
+        if explicit:
             wanted_set = {int(item) for item in wanted}
             targets = [shot for shot in shots if shot.id in wanted_set]
             if not targets:
                 raise ProviderError("所选镜头不属于该分集")
         else:
             targets = [shot for shot in shots if shot.video_media_id is None]
-
-        have_image = set(
-            (
-                await session.execute(
-                    select(ShotKeyframe.shot_id)
-                    .where(
-                        ShotKeyframe.shot_id.in_([shot.id for shot in targets]),
-                        ShotKeyframe.media_id.isnot(None),
-                    )
-                    .distinct()
+            if not targets:
+                raise ProviderError(
+                    "所有镜头都已有视频；如需重跑，请到分镜详情里逐镜重新生成"
                 )
-            ).scalars().all()
-        ) if targets else set()
-        targets = [shot for shot in targets if shot.id in have_image]
+
+        # 显式指定镜头只是允许重跑已有视频，不代表可以跳过人工认可：
+        # 重绘后认可会失效，任何路径都只能拿用户看过并点过「认可」的那一帧做首帧。
+        approve_filters = [
+            ShotKeyframe.shot_id.in_([shot.id for shot in targets]),
+            ShotKeyframe.media_id.isnot(None),
+            ShotKeyframe.approved_at.isnot(None),
+        ]
+        approved_rows = (
+            await session.execute(
+                select(ShotKeyframe.shot_id, ShotKeyframe.media_id)
+                .where(*approve_filters)
+                .order_by(ShotKeyframe.order_index.desc(), ShotKeyframe.id.desc())
+            )
+        ).all() if targets else []
+        approved_media: dict[int, int] = {}
+        for shot_id, media_id in approved_rows:
+            approved_media.setdefault(int(shot_id), int(media_id))
+        targets = [shot for shot in targets if shot.id in approved_media]
         if not targets:
-            raise ProviderError("所选镜头都还没有关键帧，请先生成图片再批量生视频")
+            if explicit:
+                raise ProviderError(
+                    "所选镜头还没有已认可的关键帧，请先在分镜详情里生成并认可画面"
+                )
+            raise ProviderError(
+                "还没有已认可的关键帧。请先在分镜详情里逐镜生成，确认画面后点「认可」，"
+                "再回到这里批量生视频"
+            )
 
         asset_ids = sorted({int(item) for item in (params.get("asset_ids") or []) if item})
         tasks = []
@@ -402,6 +420,8 @@ async def _batch_generate_videos(state: PipelineState) -> dict[str, Any]:
                         "prompt": shot.video_prompt,
                         "duration": params.get("duration"),
                         "resolution": params.get("resolution") or shot.resolution,
+                        # 首帧固定用用户认可的那一张，不受之后手动改主帧影响
+                        "image_media_id": approved_media.get(shot.id),
                         "asset_ids": asset_ids or None,
                         "negative_prompt": params.get("negative_prompt"),
                         "flow": "pipeline_videos",

@@ -27,6 +27,28 @@ async def _media_urls(db: AsyncSession, media_ids: set[int]) -> dict[int, str]:
     return {row[0]: row[1] for row in rows}
 
 
+async def _media_meta(db: AsyncSession, media_ids: set[int]) -> dict[int, dict]:
+    if not media_ids:
+        return {}
+    rows = (
+        await db.execute(
+            select(MediaAsset.id, MediaAsset.meta).where(MediaAsset.id.in_(media_ids))
+        )
+    ).all()
+    return {row[0]: (row[1] or {}) for row in rows}
+
+
+def _apply_reference_meta(item: ShotKeyframeRead, meta: dict) -> None:
+    """把出图时记录的参考图体检结果挂到关键帧上，前端直接展示「这一帧像不像本人」的证据。"""
+    item.reference_count = int(meta.get("reference_count") or 0)
+    item.reference_used = meta.get("reference_used")
+    item.reference_roles = list(meta.get("reference_roles") or [])
+    item.reference_warning = meta.get("reference_warning")
+    item.reference_issues = list(meta.get("reference_issues") or [])
+    review = meta.get("visual_review")
+    item.visual_review = review if isinstance(review, dict) else None
+
+
 async def serialize_shots(db: AsyncSession, shots: list[Shot]) -> list[ShotRead]:
     """给分镜补全关键帧列表 / 视频的访问地址。"""
     keyframe_map = await load_keyframes(db, [shot.id for shot in shots])
@@ -39,13 +61,30 @@ async def serialize_shots(db: AsyncSession, shots: list[Shot]) -> list[ShotRead]
         if mid
     }
     urls = await _media_urls(db, media_ids)
+    metas = await _media_meta(
+        db,
+        {
+            mid
+            for shot in shots
+            for mid in (
+                [shot.video_media_id]
+                + [item.media_id for item in keyframe_map.get(shot.id, [])]
+            )
+            if mid
+        },
+    )
 
     result: list[ShotRead] = []
     for shot in shots:
         item = ShotRead.model_validate(shot)
         item.video_url = urls.get(shot.video_media_id)
-        item.keyframes = [
-            ShotKeyframeRead(
+        if shot.video_media_id:
+            meta = metas.get(shot.video_media_id) or {}
+            review = meta.get("continuity_review")
+            item.continuity_review = review if isinstance(review, dict) else None
+        item.keyframes = []
+        for keyframe in keyframe_map.get(shot.id, []):
+            keyframe_item = ShotKeyframeRead(
                 id=keyframe.id,
                 shot_id=keyframe.shot_id,
                 media_id=keyframe.media_id,
@@ -53,11 +92,13 @@ async def serialize_shots(db: AsyncSession, shots: list[Shot]) -> list[ShotRead]
                 label=keyframe.label,
                 prompt=keyframe.prompt,
                 is_primary=keyframe.is_primary,
+                approved_at=keyframe.approved_at,
                 created_at=keyframe.created_at,
                 url=urls.get(keyframe.media_id),
             )
-            for keyframe in keyframe_map.get(shot.id, [])
-        ]
+            if keyframe.media_id:
+                _apply_reference_meta(keyframe_item, metas.get(keyframe.media_id, {}))
+            item.keyframes.append(keyframe_item)
         result.append(item)
     return result
 
@@ -66,6 +107,8 @@ async def serialize_keyframe(db: AsyncSession, keyframe: ShotKeyframe) -> ShotKe
     item = ShotKeyframeRead.model_validate(keyframe)
     if keyframe.media_id:
         item.url = (await _media_urls(db, {keyframe.media_id})).get(keyframe.media_id)
+        meta = (await _media_meta(db, {keyframe.media_id})).get(keyframe.media_id, {})
+        _apply_reference_meta(item, meta)
     return item
 
 

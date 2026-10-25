@@ -32,7 +32,12 @@ import { credentialApi, providerApi } from '@/api/endpoints'
 import { describeError } from '@/api/client'
 import type { Credential, CredentialPayload, ProviderInfo } from '@/api/types'
 
-const CAP_LABEL: Record<string, string> = { text: '文本', image: '图片', video: '视频' }
+const CAP_LABEL: Record<string, string> = {
+  text: '文本',
+  image: '图片',
+  video: '视频',
+  vision: '视觉（读图审查）',
+}
 
 export default function CredentialsPage() {
   const { message } = App.useApp()

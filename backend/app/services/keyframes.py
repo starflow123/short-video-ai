@@ -1,6 +1,8 @@
 """关键帧领域逻辑：查询、主帧选取、生成结果落位。"""
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -54,6 +56,20 @@ async def set_primary(db: AsyncSession, shot_id: int, keyframe_id: int) -> None:
     )
 
 
+async def approve(db: AsyncSession, keyframe: ShotKeyframe) -> None:
+    """人工认可某一帧：同一镜头只保留这一帧为已认可，并同步设为主帧。
+
+    批量生视频只消费已认可的帧，所以「认可」既是质量闸门，也是首帧选择。
+    """
+    await db.execute(
+        update(ShotKeyframe)
+        .where(ShotKeyframe.shot_id == keyframe.shot_id, ShotKeyframe.id != keyframe.id)
+        .values(approved_at=None)
+    )
+    keyframe.approved_at = datetime.now(timezone.utc)
+    await set_primary(db, keyframe.shot_id, keyframe.id)
+
+
 async def attach_generated_image(
     db: AsyncSession,
     *,
@@ -85,6 +101,10 @@ async def attach_generated_image(
         await db.flush()
         if promote_primary and existing:
             await set_primary(db, shot.id, keyframe.id)
+    # 画面一变，原来的「已认可」就失效：用户认可的是一张具体的图，不是这个位置。
+    # 清空 approved_at 后该帧会退出批量生视频，必须重新看过再认可。
+    if keyframe.media_id and keyframe.media_id != media_id:
+        keyframe.approved_at = None
     keyframe.media_id = media_id
     # 始终用本次实际使用的提示词覆盖，保证「重绘」后关键帧上的提示词与实际出图一致
     if prompt:

@@ -144,6 +144,21 @@ export default function ProjectDetailPage() {
   const [pipelineBusy, setPipelineBusy] = useState(false)
   const [confirmBusy, setConfirmBusy] = useState(false)
   const [confirmShotId, setConfirmShotId] = useState<number | null>(null)
+  const [videoBatchBusy, setVideoBatchBusy] = useState(false)
+
+  /** 已有人工认可关键帧的镜头数：批量生视频只会消费这些镜头 */
+  const approvedShotCount = useMemo(
+    () => shots.filter((shot) => shot.keyframes.some((item) => item.approved_at)).length,
+    [shots],
+  )
+  /** 其中还没有视频的镜头数：为 0 时批量按钮无事可做 */
+  const pendingVideoCount = useMemo(
+    () =>
+      shots.filter(
+        (shot) => !shot.video_url && shot.keyframes.some((item) => item.approved_at),
+      ).length,
+    [shots],
+  )
 
   // 项目资产（角色 / 场景 / 道具 / 服装）：以图片卡片平铺在页面顶部，方便随时回看与复用
   const [assets, setAssets] = useState<ProductionAsset[]>([])
@@ -262,14 +277,13 @@ export default function ProjectDetailPage() {
     } else if (broken) {
       const auto = Number(task.result?.auto_image_tasks ?? 0)
       const sheets = Number(task.result?.reference_tasks ?? 0)
-      const keys = Number(task.result?.keyframe_tasks ?? 0)
       const made = Number(task.result?.shot_count ?? 0)
       const planned = Number(task.result?.planned_shots ?? 0)
       const short = planned > made ? `（方案要 ${planned} 镜，模型只给出 ${made} 镜，可再拆一次补齐）` : ''
       const imageNote = auto
         ? sheets
-          ? `，先生成 ${sheets} 张角色定妆照，再出 ${keys} 张关键帧（关键帧会带上人物参考图，逐个完成后刷新）`
-          : `，${keys} 张关键帧排队中（逐个完成后刷新）`
+          ? `，正在生成 ${sheets} 张角色定妆照；关键帧请到各镜头里逐张生成，满意后点「认可」`
+          : '，角色定妆照已齐；关键帧请到各镜头里逐张生成，满意后点「认可」'
         : ''
       message.success(`已按方案拆出 ${made} 个分镜${short}${imageNote}`)
     } else if (isPipeline) {
@@ -340,7 +354,7 @@ export default function ProjectDetailPage() {
   // 第一步：只出方案，不动现有分镜
   const openBreakModal = () => {
     breakForm.setFieldsValue({
-      auto_images: true,
+      auto_images: false,
       shot_count: activeEpisode?.shot_count || null,
       target_seconds: null,
     })
@@ -531,6 +545,26 @@ export default function ProjectDetailPage() {
       message.error(describeError(error))
     } finally {
       setConfirmShotId(null)
+    }
+  }
+
+  /** 批量生视频：只消费已人工认可的关键帧，全部完成后自动导出成片。 */
+  const runBatchVideos = async () => {
+    if (!pipelineRun) return
+    setVideoBatchBusy(true)
+    try {
+      const run = await pipelineApi.videos(pipelineRun.id, {})
+      setPipelineRun(run)
+      if (run.task_id) watch(run.task_id)
+      message.success('已提交批量生视频：只使用已认可的关键帧')
+      if (activeEpisode) {
+        await loadShots(activeEpisode.id)
+        await loadPipeline(activeEpisode.id)
+      }
+    } catch (error) {
+      message.error(describeError(error))
+    } finally {
+      setVideoBatchBusy(false)
     }
   }
 
@@ -747,7 +781,8 @@ export default function ProjectDetailPage() {
                         {PIPELINE_STATUS[pipelineRun.status]?.text ?? pipelineRun.status}
                       </Tag>
                       <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                        已确认 {pipelineRun.confirmed_shots}/{pipelineRun.total_shots} · 已出图 {pipelineRun.generated_shots}
+                        已确认 {pipelineRun.confirmed_shots}/{pipelineRun.total_shots} · 已出图{' '}
+                        {pipelineRun.generated_shots} · 已认可关键帧 {approvedShotCount}
                       </Typography.Text>
                     </Space>
                   }
@@ -778,6 +813,23 @@ export default function ProjectDetailPage() {
                           </Button>
                         </>
                       )}
+                      <Tooltip
+                        title={
+                          pendingVideoCount === 0
+                            ? '所有已认可镜头都已有视频；如需重跑请到分镜详情逐镜重新生成'
+                            : '只使用已人工认可的关键帧作为首帧；未认可的镜头不会进入成片'
+                        }
+                      >
+                        <Button
+                          size="small"
+                          icon={<VideoCameraAddOutlined />}
+                          loading={videoBatchBusy}
+                          disabled={pendingVideoCount === 0}
+                          onClick={() => void runBatchVideos()}
+                        >
+                          批量生视频（待生成 {pendingVideoCount}）
+                        </Button>
+                      </Tooltip>
                     </Space>
                   }
                 >
@@ -934,6 +986,7 @@ export default function ProjectDetailPage() {
                               <Typography.Text type="secondary" style={{ fontSize: 11.5 }}>
                                 {shot.camera ? `${shot.camera} · ` : ''}
                                 {shot.duration_seconds}s · 关键帧 {shot.keyframes.length} 张
+                                {shot.keyframes.some((item) => item.approved_at) ? ' · 已认可' : ''}
                               </Typography.Text>
                               {shot.directives && (shot.directives.mood_tags?.length || shot.directives.atmosphere) ? (
                                 <div style={{ marginTop: 6, display: 'flex', flexWrap: 'wrap', gap: 4 }}>
@@ -1162,7 +1215,7 @@ export default function ProjectDetailPage() {
             </Col>
           </Row>
           <Form.Item name="auto_images" valuePropName="checked" noStyle>
-            <Checkbox>拆解完成后自动生成定妆照与每个镜头的关键帧</Checkbox>
+            <Checkbox>拆解完成后自动生成角色定妆照（关键帧逐镜生成、逐镜认可）</Checkbox>
           </Form.Item>
         </Form>
 

@@ -134,6 +134,19 @@ export interface ShotDirectives {
   composition?: string | null
 }
 
+export interface VisualReview {
+  verdict: 'pass' | 'warn' | 'fail'
+  checks: Record<string, 'pass' | 'warn' | 'fail' | 'unknown'>
+  reasons: string[]
+  prompt_patch?: string | null
+  provider?: string
+  model?: string
+  reviewed_at?: string
+  /** AI 只给建议：永远不代替用户点「认可」 */
+  advisory?: boolean
+  reference_sheets?: number
+}
+
 export interface ShotKeyframe {
   id: number
   shot_id: number
@@ -142,8 +155,18 @@ export interface ShotKeyframe {
   label?: string | null
   prompt?: string | null
   is_primary: boolean
+  /** 用户已人工认可这一帧（批量生视频只消费已认可的帧）；重绘后自动清空 */
+  approved_at?: string | null
   created_at: string
   url?: string | null
+  /** 出图时的参考图体检：数量 / 是否真正送达 / 对应角色 / 缺失原因 */
+  reference_count: number
+  reference_used?: boolean | null
+  reference_roles: { kind?: string | null; name?: string | null }[]
+  reference_warning?: string | null
+  reference_issues: string[]
+  /** AI 视觉初审结论（只读建议） */
+  visual_review?: VisualReview | null
 }
 
 export interface ShotNeighbor {
@@ -151,6 +174,22 @@ export interface ShotNeighbor {
   order_index: number
   title?: string | null
   summary?: string | null
+}
+
+/** 切点审查：上一镜尾帧 vs 本镜首帧（人 / 服装 / 场景 / 光线 / 首帧贴合）。 */
+export interface ContinuityReview {
+  verdict: 'pass' | 'warn' | 'fail' | string
+  checks: Record<string, 'pass' | 'warn' | 'fail' | 'unknown' | string>
+  reasons: string[]
+  provider: string
+  model: string
+  from_shot_id: number
+  to_shot_id: number
+  from_media_id: number
+  to_media_id: number
+  reviewed_at: string
+  /** 只给建议，不代替人工判断 */
+  advisory: boolean
 }
 
 /** 镜头里的一个主体：谁、在哪、在做什么、什么神态、手里拿什么。 */
@@ -222,6 +261,8 @@ export interface Shot {
   prompt_confirmed: boolean
   video_media_id?: number | null
   video_url?: string | null
+  /** 与上一镜的切点审查结论（AI 建议；视频没变时复用） */
+  continuity_review?: ContinuityReview | null
   keyframes: ShotKeyframe[]
   /** 相邻镜头：生成关键帧 / 视频时会自动带入上下文，保障画面连续 */
   prev_shot?: ShotNeighbor | null
@@ -378,6 +419,8 @@ export interface GenerationPayload {
   image_media_id?: number | null
   keyframe_id?: number | null
   keyframe_label?: string | null
+  /** 追加一张并承接上一张，不替换该镜头当前画面（逐镜确认的主路径） */
+  append?: boolean
   /** 逐张关键帧提示词：n>1 时第 i 张用 keyframe_prompts[i]（起幅/中段/落幅各用各的） */
   keyframe_prompts?: string[] | null
   /** 关联资产：后端把资产外观描述拼进提示词，保证跨镜头是同一个人 / 场景 / 道具 */
@@ -500,6 +543,7 @@ export interface PipelineRun {
   total_shots: number
   confirmed_shots: number
   generated_shots: number
+  generated_videos: number
 }
 
 export interface PipelineStartPayload {
@@ -520,6 +564,16 @@ export interface PipelineConfirmPayload {
   asset_ids?: number[] | null
   negative_prompt?: string | null
   include_character_assets?: boolean
+}
+
+export interface PipelineVideoPayload {
+  /** 不传 = 只补齐已认可关键帧且还没有视频的镜头 */
+  shot_ids?: number[] | null
+  credential_id?: number | null
+  provider?: string | null
+  model?: string | null
+  asset_ids?: number[] | null
+  negative_prompt?: string | null
 }
 
 export interface BreakdownPayload {

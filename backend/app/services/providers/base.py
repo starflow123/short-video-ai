@@ -24,7 +24,7 @@ ProgressCb = Callable[[int], None]
 class ProviderSpec:
     key: str
     label: str
-    capabilities: tuple[str, ...]  # 取值集合：text / image / video
+    capabilities: tuple[str, ...]  # 取值集合：text / image / video / vision（读图审查）
     default_base_url: str
     models: dict[str, list[str]]  # capability -> 可选模型列表（首个为默认）
     docs_url: str = ""
@@ -172,6 +172,20 @@ class BaseProvider(ABC):
         json_mode: bool = False,
     ) -> str:
         raise ProviderError(f"{self.spec.label} 不支持文本生成")
+
+    async def generate_vision(
+        self,
+        prompt: str,
+        *,
+        images: Sequence[tuple[str, bytes]],
+        system: str | None = None,
+        model: str | None = None,
+        temperature: float = 0.1,
+        max_tokens: int = 900,
+        json_mode: bool = True,
+    ) -> str:
+        """多图理解：``images`` 为 (图注, 原始字节)，返回模型文本（通常为 JSON）。"""
+        raise ProviderError(f"{self.spec.label} 不支持视觉理解")
 
     async def generate_image(
         self,

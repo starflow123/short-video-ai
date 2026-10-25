@@ -27,6 +27,14 @@ class Settings(BaseSettings):
     max_upload_mb: int = 512
     generation_timeout: int = 900
 
+    # 关键帧视觉初审：开启后在生图任务末尾顺带调一次视觉模型（只给建议、不阻断）。
+    # 关掉后不产生任何额外调用与任务，行为与接入前完全一致。
+    vision_review_enabled: bool = True
+
+    # 切点连续性审查：导出前比对相邻镜头尾帧/首帧（人 / 服装 / 场景 / 光线）。
+    # 只出报告、不阻断导出；视频没变时复用上次结论，关掉后 0 额外调用。
+    continuity_review_enabled: bool = True
+
     # 首次部署可留空（允许自由注册）；设置后注册必须携带同样的邀请码
     registration_invite_code: str = ""
     # 媒体地址签名有效期：厂商拉取参考图用的临时链接

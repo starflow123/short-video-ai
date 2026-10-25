@@ -228,8 +228,19 @@ class ShotKeyframeRead(BaseModel):
     label: str | None = None
     prompt: str | None = None
     is_primary: bool
+    approved_at: datetime | None = None
     created_at: datetime
     url: str | None = None
+    # 本帧实际送进模型的参考图：数量、对应角色、是否真正送达（false = 厂商降级为纯文生图）、
+    # 以及缺脸原因（没建档 / 定妆照没出 / 拿不到公网地址）。
+    reference_count: int = 0
+    reference_used: bool | None = None
+    reference_roles: list[dict] = Field(default_factory=list)
+    reference_warning: str | None = None
+    reference_issues: list[str] = Field(default_factory=list)
+    # AI 初审结论（只给建议，不改变「认可」状态）：
+    # verdict / checks / reasons / prompt_patch / reviewed_at
+    visual_review: dict | None = None
 
 
 class ShotFieldSuggestRequest(BaseModel):
@@ -304,6 +315,8 @@ class ShotRead(BaseModel):
     prompt_confirmed: bool = False
     video_media_id: int | None = None
     video_url: str | None = None
+    # 与上一镜的切点审查结论（AI 建议；视频未变时复用）
+    continuity_review: dict | None = None
     keyframes: list[ShotKeyframeRead] = Field(default_factory=list)
     # 前后镜头（生成提示词时会自动带入，用于保障画面连续性）
     prev_shot: ShotNeighborRead | None = None
