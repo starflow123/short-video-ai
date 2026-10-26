@@ -24,6 +24,22 @@ app.add_middleware(
 app.include_router(api_router, prefix="/api")
 
 
+@app.on_event("startup")
+async def load_compiler_templates() -> None:
+    """启动时装载已认可的全局模板覆盖；数据库还没迁移好时按内置模板跑。"""
+    try:
+        from app.db.session import AsyncSessionLocal
+        from app.services.compiler_templates import load_active
+
+        async with AsyncSessionLocal() as session:
+            overrides = await load_active(session)
+        from app.services.prompts import set_template_overrides
+
+        set_template_overrides(overrides)
+    except Exception:  # noqa: BLE001 - 模板覆盖是增强能力
+        pass
+
+
 @app.middleware("http")
 async def protect_media(request: Request, call_next):
     prefix = settings.media_url_prefix.rstrip("/") + "/"

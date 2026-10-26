@@ -10,6 +10,7 @@ from app.services.agents import continuity
 def _shot(shot_id: int, order: int, *, title: str, description: str, subjects=None):
     return SimpleNamespace(
         id=shot_id,
+        episode_id=7,
         order_index=order,
         title=title,
         description=description,
@@ -320,3 +321,82 @@ def test_export_runs_continuity_before_concat(monkeypatch):
 
     assert calls == ["review", "export"]
     assert result["continuity"]["cuts"] == 1
+
+
+class _CutAuditSession:
+    """只提供 review_cut 需要的 Episode 读取与 add/flush。"""
+
+    def __init__(self, episode):
+        self.episode = episode
+        self.added: list = []
+
+    async def get(self, model, pk):  # noqa: ANN001 - 测试替身
+        return self.episode if getattr(model, "__name__", "") == "Episode" else None
+
+    def add(self, obj) -> None:
+        self.added.append(obj)
+
+    async def flush(self) -> None:
+        return None
+
+
+def test_review_cut_also_writes_audit_run(monkeypatch):
+    from app.models.agent_run import AgentRun
+    from app.services import generation
+
+    prev_asset = SimpleNamespace(id=10, meta={}, path="a.mp4")
+    next_asset = SimpleNamespace(id=11, meta={}, path="b.mp4")
+
+    async def _video_asset(session, shot):
+        return prev_asset if shot.id == 1 else next_asset
+
+    async def _extract_frame(path, *, at_end):
+        return b"\x89PNG\r\n\x1a\nframe"
+
+    async def _no_keyframe(session, shot):
+        return None
+
+    class _Provider:
+        def supports(self, capability: str) -> bool:
+            return capability == "vision"
+
+        def model_for(self, capability: str) -> str:
+            return "deepseek-flash"
+
+        async def generate_vision(self, prompt, *, images, system, json_mode, max_tokens):
+            return (
+                '{"verdict":"fail","checks":{"same_person":"pass",'
+                '"costume_continuity":"fail"},"reasons":["校服从黑变灰"]}'
+            )
+
+    async def fake_resolve(*args, **kwargs):
+        return SimpleNamespace(id=3, provider="deepseek")
+
+    monkeypatch.setattr(generation, "resolve_credential", fake_resolve)
+    monkeypatch.setattr(generation, "build_provider_from", lambda credential: _Provider())
+    monkeypatch.setattr(continuity, "_video_asset", _video_asset)
+    monkeypatch.setattr(continuity, "_extract_frame", _extract_frame)
+    monkeypatch.setattr(continuity, "_keyframe_image", _no_keyframe)
+
+    session = _CutAuditSession(SimpleNamespace(id=7, project_id=9))
+    report = asyncio.run(
+        continuity.review_cut(
+            session,
+            user_id=1,
+            prev_shot=_shot(1, 1, title="A", description="a"),
+            shot=_shot(2, 2, title="B", description="b"),
+        )
+    )
+
+    assert report["verdict"] == "fail"
+    assert next_asset.meta["continuity_review"]["verdict"] == "fail"
+    run = session.added[-1]
+    assert isinstance(run, AgentRun)
+    assert run.kind == "continuity_review"
+    assert run.status == "fail"
+    assert run.project_id == 9
+    assert run.target_type == "shot"
+    assert run.target_id == 2
+    assert run.steps == 1
+    assert run.summary["from_shot_id"] == 1
+    assert run.summary["checks"]["costume_continuity"] == "fail"

@@ -22,6 +22,7 @@ from app.models.episode import Episode
 from app.models.media import MediaAsset
 from app.models.shot import Shot
 from app.services import prompts
+from app.services.agents.audit import record_run
 from app.services.keyframes import load_keyframes
 from app.services.providers.base import ProviderError
 from app.services.storage import asset_bytes
@@ -372,10 +373,34 @@ async def review_cut(
         from_shot_id=prev_shot.id,
         to_shot_id=shot.id,
         has_keyframe=bool(keyframe),
-        subject_count=len(_as_list(prev_shot.subjects)) + len(_as_list(shot.subjects)),
+        # 两端都没有「人物」时才放宽人物项：动物没有脸可比对
+        subject_count=len(prompts.split_subject_names(_as_list(prev_shot.subjects))[0])
+        + len(prompts.split_subject_names(_as_list(shot.subjects))[0]),
     )
     asset.meta = {**(asset.meta or {}), "continuity_review": report}
     await session.flush()
+    episode = await session.get(Episode, shot.episode_id) if shot.episode_id else None
+    # 单次审查器也进统一审计，和 5 个循环 agent 一样可在「AI 处理记录」里回看
+    await record_run(
+        session,
+        user_id=user_id,
+        kind="continuity_review",
+        status=report["verdict"],
+        project_id=episode.project_id if episode else None,
+        target_type="shot",
+        target_id=int(shot.id),
+        model=report["model"],
+        steps=1,
+        summary={
+            "verdict": report["verdict"],
+            "checks": report["checks"],
+            "reasons": report["reasons"],
+            "from_shot_id": report["from_shot_id"],
+            "to_shot_id": report["to_shot_id"],
+            "from_media_id": report["from_media_id"],
+            "to_media_id": report["to_media_id"],
+        },
+    )
     return report
 
 

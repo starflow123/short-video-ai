@@ -12,3 +12,5 @@ class EditCreateIn(BaseModel):
     aspect_ratio: str = Field(default="9:16")
     pace: str = Field(default="medium")
     instruction: str | None = Field(default=None, max_length=500)
+    # 成片归属的项目：留空则进「未归属素材」，不会消失在素材库里
+    project_id: int | None = Field(default=None)

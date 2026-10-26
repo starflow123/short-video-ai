@@ -14,6 +14,7 @@ import MediaPage from '@/pages/MediaPage'
 import AssetsPage from '@/pages/AssetsPage'
 import PromptsPage from '@/pages/PromptsPage'
 import SmartEditPage from '@/pages/SmartEditPage'
+import InsightsPage from '@/pages/InsightsPage'
 
 function Protected({ children }: { children: ReactNode }) {
   const { user, loading } = useAuth()
@@ -52,6 +53,7 @@ export default function AppRoutes() {
         {/* /tasks/orphan 必须交给动态路由处理：走独立的静态路由时 useParams 拿不到
             projectId，TasksPage 里的孤儿任务分支永远进不去，点了只会留在项目卡片视图 */}
         <Route path="/tasks/:projectId" element={<TasksPage />} />
+        <Route path="/insights" element={<InsightsPage />} />
         <Route path="/edit" element={<SmartEditPage />} />
         <Route path="/media" element={<MediaPage />} />
         <Route path="/media/:projectId" element={<MediaPage />} />

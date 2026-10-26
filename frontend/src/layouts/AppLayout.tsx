@@ -4,6 +4,7 @@ import {
   DashboardOutlined,
   FileTextOutlined,
   KeyOutlined,
+  LineChartOutlined,
   MenuFoldOutlined,
   MenuOutlined,
   PictureOutlined,
@@ -28,6 +29,7 @@ const NAV = [
   { key: '/prompts', icon: <FileTextOutlined />, label: '提示词模板' },
   { key: '/credentials', icon: <KeyOutlined />, label: '密钥管理' },
   { key: '/tasks', icon: <DashboardOutlined />, label: '任务中心' },
+  { key: '/insights', icon: <LineChartOutlined />, label: '质量看板' },
   { key: '/media', icon: <PictureOutlined />, label: '素材库' },
 ]
 

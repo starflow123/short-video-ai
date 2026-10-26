@@ -42,6 +42,8 @@ def _now() -> datetime:
 # 统一纯色背景 + 中性光线，才能作为后续分镜图生图的稳定参考。
 CHARACTER_SHEET_PROMPT = (
     "角色定妆参考图：同一位角色的正面、侧面、全身三视图并排，"
+    "每个视角都是从头顶到脚底完整入画的人物，头顶上方留白、鞋子不被裁切，"
+    "人物在各自画格里竖向占约 90% 高度，"
     "背景为均匀的中灰色摄影棚无缝背景纸，中性均匀光线，"
     "五官与服装细节完整清晰，全身比例准确，中性站姿，画面简洁，无夸张透视"
 )
@@ -71,6 +73,29 @@ def _appearance_lock(asset: ProductionAsset) -> str:
     return "；".join(parts)[:600]
 
 
+def sheet_prompt_for(asset: ProductionAsset) -> tuple[str, str]:
+    """资产参考图（角色定妆三视图 / 道具单件正视图）的提示词与负面词。
+
+    拆解后的自动补图与资产页的「重新生成」共用这一份，否则两条入口的构图要求会各自漂移。
+    必须先剥掉旧的构图指令：生成成功后实际发送的提示词会写回 ``asset.prompt``，
+    不剥就会每重画一次多叠一遍「三视图」，越叠越长、新旧要求并存。
+    """
+    if asset.kind == "actor":
+        base = prompts.strip_sheet_directives(
+            (asset.prompt or asset.description or "").strip()
+        )
+        # 外观描述本身常以「。」结尾，直接拼会留下「。。」；先收掉尾部标点再统一加
+        return f"{base.rstrip('。；.')}。{CHARACTER_SHEET_PROMPT}", "text, logo, watermark"
+    # 道具档案里的描述常是「正在被推向他 / 被握在手中」这类使用状态，
+    # 直接喂会被模型补上一只手甚至一个人；参考图只画物品本体，用名称重新起句。
+    attributes = asset.attributes if isinstance(asset.attributes, dict) else {}
+    look = str(attributes.get("appearance") or "").strip()
+    base = str(asset.name or "").strip()
+    if look:
+        base = f"{base}，外观：{look}"
+    return PROP_SHEET_PROMPT.format(name=base), PROP_SHEET_NEGATIVE
+
+
 async def _spawn_asset_reference_tasks(
     session: AsyncSession,
     *,
@@ -81,12 +106,14 @@ async def _spawn_asset_reference_tasks(
     provider: str | None = None,
     model: str | None = None,
     credential_id: int | None = None,
+    skip_reason: list[str] | None = None,
 ) -> list[GenerationTask]:
     """给还没有参考图的角色 / 道具各建一张参考图任务（只落库，投递由调用方决定）。
 
     角色出「定妆三视图」，道具出「单件正视图」，出图后由 ``_handle_image`` 自动挂成
     该资产的参考图，成为后续分镜生成的默认图像参考。没有可用图片凭证时返回空列表，
     不阻塞主流程（角色档案本身已经落库，只是暂时没有参考图）。
+    ``skip_reason`` 用于把「为什么没出参考图」带回任务结果，避免静默跳过。
     """
     from app.services.dispatch import create_task
 
@@ -99,26 +126,15 @@ async def _spawn_asset_reference_tasks(
         return []
     try:
         await resolve_credential(session, user_id, "image", credential_id, provider)
-    except ProviderError:
-        logger.info("未配置可用图片凭证，跳过资产参考图自动生成")
+    except ProviderError as exc:
+        logger.info("未配置可用图片凭证，跳过资产参考图自动生成：%s", exc)
+        if skip_reason is not None:
+            skip_reason.append(f"{exc}；请先在「设置 → 模型凭证」里配置可用的图片凭证")
         return []
 
     tasks: list[GenerationTask] = []
     for asset in pending:
-        if asset.kind == "actor":
-            base = (asset.prompt or asset.description or "").strip()
-            prompt = f"{base}。{CHARACTER_SHEET_PROMPT}"
-            negative = "text, logo, watermark"
-        else:
-            # 道具档案里的描述常是「正在被推向他 / 被握在手中」这类使用状态，
-            # 直接喂会被模型补上一只手甚至一个人；参考图只画物品本体，用名称重新起句。
-            attributes = asset.attributes if isinstance(asset.attributes, dict) else {}
-            look = str(attributes.get("appearance") or "").strip()
-            base = str(asset.name or "").strip()
-            if look:
-                base = f"{base}，外观：{look}"
-            prompt = PROP_SHEET_PROMPT.format(name=base)
-            negative = PROP_SHEET_NEGATIVE
+        prompt, negative = sheet_prompt_for(asset)
         tasks.append(
             await create_task(
                 session,
@@ -363,8 +379,10 @@ async def _aspect_of(session: AsyncSession, shot: Shot | None) -> str:
 
 
 async def _style_of(session: AsyncSession, shot: Shot | None) -> str | None:
+    """项目级风格文案。必须与真实生成走同一个来源，否则「编译预览」少一截风格词，
+    预览看着有画风、实际出图却没有（实测手绘动画项目被生成成真人照片）。"""
     project = await _project_of_shot(session, shot)
-    return project.style if project else None
+    return _project_style_text(project)
 
 
 # ---------------------------------------------------------------- 前后镜头上下文
@@ -716,12 +734,46 @@ _SCENE_ELEMENT_HINTS = (
 )
 
 
-def _scene_key(shot: Shot) -> str:
+def _scene_phrase(shot: Shot) -> str:
+    """取 location 里真正表示「哪个场景」的那半句。
+
+    中文地点串是从大到小写的（「海边小镇的旧巴士站旁，通向面包店的窄巷口」），
+    所以最具体的那一段才是本镜的场景：取逗号后的最后一段，括号里的补充先整段去掉。
+    早先按第一段判，等于拿大范围当场景，实测把 4 号镜（窄巷口）和 3 号镜（巴士站）
+    判成同一场戏，接力参考直接把上一镜的海边长椅构图抄了过来。
+    """
     location = str((shot.start_state or {}).get("location") or "").strip()
+    location = re.sub(r"（[^）]*）|\([^)]*\)", "", location).strip()
+    for separator in ("，", ",", "、", "。", "；", ";"):
+        parts = [item.strip() for item in location.split(separator) if item.strip()]
+        if parts:
+            location = parts[-1]
     for suffix in _SCENE_SUFFIXES:
         if location.endswith(suffix):
             location = location[: -len(suffix)]
     return location.strip()
+
+
+# 换个机位就把 location 整串改了（「旧面包店门口的木质门槛前」vs「旧面包店木质橱窗前」），
+# 整串相等永远对不上 → 上一帧连续性参考不生效，退回多张定妆照，实测就画出了分身。
+# 同一场戏的 location 开头都是同一个地点名，所以按公共前缀判定；两边都没写 location 时
+# 沿用原来的「算同一场戏」，不至于把旧数据的接力也断掉。阈值取 4 个字：
+# 「海边长椅」与「海边小镇的旧巴士站」只共 2 字，不同场景；「旧面包店门口…」与「旧面包店橱窗…」共 4 字，同场景。
+_MIN_SCENE_PREFIX = 4
+
+
+def _same_scene(first: Shot, second: Shot) -> bool:
+    left, right = _scene_phrase(first), _scene_phrase(second)
+    if not left or not right:
+        return left == right
+    if left == right:
+        return True
+    shared = 0
+    for first_char, second_char in zip(left, right):
+        if first_char != second_char:
+            break
+        shared += 1
+    return shared >= _MIN_SCENE_PREFIX
 
 
 def _is_scene_element(name: str | None) -> bool:
@@ -796,7 +848,6 @@ async def _previous_shot_reference(session: AsyncSession, shot: Shot) -> dict | 
     current_cast = _named_subject_set(shot)
     if not current_cast:
         return None
-    target_scene = _scene_key(shot)
     previous_shots = (
         await session.execute(
             select(Shot)
@@ -807,7 +858,7 @@ async def _previous_shot_reference(session: AsyncSession, shot: Shot) -> dict | 
     for prev_shot in previous_shots:
         if _named_subject_set(prev_shot) != current_cast:
             continue
-        if _scene_key(prev_shot) != target_scene:
+        if not _same_scene(prev_shot, shot):
             continue
         # 上一帧露脸、本镜要背对镜头时，i2i 会保留上一帧那张脸再补一个背影，画出两个人
         if _hides_face(shot) and not _hides_face(prev_shot):
@@ -851,7 +902,7 @@ async def _next_continuation_frame(session: AsyncSession, shot: Shot) -> str | N
     current_cast = _named_subject_set(shot)
     if not current_cast or _named_subject_set(next_shot) != current_cast:
         return None
-    if _scene_key(next_shot) != _scene_key(shot):
+    if not _same_scene(next_shot, shot):
         return None
     keyframes = (await load_keyframes(session, [next_shot.id])).get(next_shot.id, [])
     primary = primary_keyframe(keyframes)
@@ -1193,7 +1244,7 @@ async def suggest_shot_field(
     return value
 
 
-async def build_prompt_preview(
+async def build_shot_compile_inputs(
     session: AsyncSession,
     *,
     user_id: int,
@@ -1201,10 +1252,10 @@ async def build_prompt_preview(
     kind: str = "image",
     extra_prompt: str | None = None,
 ) -> dict[str, Any]:
-    """编译预览：按当前分层字段拼出真实会发送的提示词，并给出分块字数。
+    """装配本镜头提示词的完整编译输入（与真实生成共用一套来源）。
 
-    与生成时共用 ``compose_generation_prompt``，所以「哪块会被裁」在点生成之前就能看到。
-    参考图图例按本镜主体可解析到的资产估算，实际选图仍以生成时为准。
+    预览和金镜头快照导出都从这里拿输入：冻结这份 dict，将来重编译就能
+    逐字复算出当时的提示词，编译器改坏了回归测试立刻能发现。
     """
     project = await _project_of_shot(session, shot)
     aspect_ratio = await _aspect_of(session, shot)
@@ -1235,27 +1286,48 @@ async def build_prompt_preview(
         if kind == "video"
         else prompts.MAX_IMAGE_PROMPT_CHARS
     )
-    composed, blocks = prompts.compose_generation_prompt(
-        base=base,
-        kind=kind,
-        style=style,
-        aspect_ratio=aspect_ratio,
-        assets=assets or None,
-        negative=None,
-        continuity=continuity,
-        subjects=shot.subjects or None,
-        props=shot.props or None,
-        timeline=shot.action_timeline or None,
-        duration=shot.duration_seconds,
-        start_state=shot.start_state,
-        end_state=shot.end_state,
-        directives=shot.directives,
-        references=references or None,
-        max_chars=max_chars,
-        empty_shot=not (shot.subjects or []),
-        with_breakdown=True,
+    return {
+        "base": base,
+        "kind": kind,
+        "style": style,
+        "aspect_ratio": aspect_ratio,
+        "assets": assets or None,
+        "negative": None,
+        "continuity": continuity,
+        "subjects": shot.subjects or None,
+        "props": shot.props or None,
+        "timeline": shot.action_timeline or None,
+        "duration": shot.duration_seconds,
+        "start_state": shot.start_state,
+        "end_state": shot.end_state,
+        "directives": shot.directives,
+        "references": references or None,
+        "max_chars": max_chars,
+        "empty_shot": not (shot.subjects or []),
+        "with_breakdown": True,
+    }
+
+
+async def build_prompt_preview(
+    session: AsyncSession,
+    *,
+    user_id: int,
+    shot: Shot,
+    kind: str = "image",
+    extra_prompt: str | None = None,
+) -> dict[str, Any]:
+    """编译预览：按当前分层字段拼出真实会发送的提示词，并给出分块字数。
+
+    与生成时共用 ``compose_generation_prompt``，所以「哪块会被裁」在点生成之前就能看到。
+    参考图图例按本镜主体可解析到的资产估算，实际选图仍以生成时为准。
+    """
+    project = await _project_of_shot(session, shot)
+    inputs = await build_shot_compile_inputs(
+        session, user_id=user_id, shot=shot, kind=kind, extra_prompt=extra_prompt
     )
+    composed, blocks = prompts.compose_generation_prompt(**inputs)
     assert isinstance(composed, str)
+    max_chars = inputs["max_chars"]
     dropped = [item["tag"] for item in blocks if item["chars"] == 0]
     return {
         "kind": kind,
@@ -1286,6 +1358,7 @@ _BLOCK_LABELS = {
     "directives": "镜头语言",
     "timeline": "动作时间轴",
     "extra": "本张补充要求",
+    "repair": "本次修正",
     "assets": "资产外观",
     "quality": "画质与运动要求",
     "continuity": "前后镜头衔接",
@@ -1550,7 +1623,11 @@ async def _handle_text(session: AsyncSession, task: GenerationTask) -> dict[str,
         # 关键帧则必须逐镜生成、逐镜认可，否则一张错帧会让整批图返工。
         auto_tasks: list[GenerationTask] = []
         sheet_count = 0
+        reference_error: str | None = None
         if params.get("auto_images") and project:
+            reference_skip: list[str] = []
+            # 拆解是文本任务，params 里的凭证是文本凭证（如 DeepSeek）；
+            # 定妆照必须按「图片」能力重新解析凭证，否则会被文本凭证挡掉。
             sheet_tasks = await _spawn_asset_reference_tasks(
                 session,
                 user_id=task.user_id,
@@ -1559,12 +1636,11 @@ async def _handle_text(session: AsyncSession, task: GenerationTask) -> dict[str,
                     session, user_id=task.user_id, project_id=project.id
                 ),
                 aspect_ratio=project.aspect_ratio,
-                credential_id=params.get("credential_id"),
-                provider=params.get("provider"),
-                model=params.get("model"),
+                skip_reason=reference_skip,
             )
             auto_tasks = sheet_tasks
             sheet_count = len(sheet_tasks)
+            reference_error = reference_skip[0] if reference_skip else None
             if auto_tasks:
                 await pipeline_service._start_chain(session, auto_tasks)
 
@@ -1579,6 +1655,7 @@ async def _handle_text(session: AsyncSession, task: GenerationTask) -> dict[str,
             "plan": episode.plan,
             "assets_bound": binding,
             "reference_tasks": sheet_count,
+            "reference_error": reference_error,
             "keyframe_tasks": 0,
             "auto_image_tasks": len(auto_tasks),
         }
@@ -1853,6 +1930,8 @@ async def _handle_image(session: AsyncSession, task: GenerationTask) -> dict[str
     # 资产参考图（定妆三视图 / 道具单件图）不是分镜画面：不能套用「起幅 / 人物站位」
     # 和人体结构那套镜头质量块，否则道具图会被补上一个人（实测三张全变人像）。
     is_asset_sheet = flow == "asset_reference"
+    # 修复 agent 的候选帧：只追加一张、不替换旧帧，也不需要「承接上一张」的链式文案
+    is_repair = bool(params.get("repair_candidate"))
     shot = await session.get(Shot, int(params["shot_id"])) if params.get("shot_id") else None
 
     credentials = await resolve_fallback_chain(
@@ -1941,7 +2020,13 @@ async def _handle_image(session: AsyncSession, task: GenerationTask) -> dict[str
     empty_shot = shot is not None and not _named_subject_set(shot)
     # 「生成下一张」且已有上一张时，唯一该送的参考就是本镜头上一张（链式承接在后面拼）；
     # 再叠上一镜的连续性参考会变成两张构图模板，模型容易照抄站位。
-    append_mode = bool(params.get("append")) and bool(existing_kfs) and not params.get("asset_ids")
+    append_mode = (
+        bool(params.get("append"))
+        and bool(existing_kfs)
+        and not params.get("asset_ids")
+        and not is_repair
+    )
+    reference_policy_note: str | None = None
     if shot and supports_reference and not params.get("asset_ids"):
         previous = await _previous_shot_reference(session, shot)
         non_actor = [item for item in references if item.get("kind") != "actor"]
@@ -1975,6 +2060,24 @@ async def _handle_image(session: AsyncSession, task: GenerationTask) -> dict[str
             else:
                 references = []
     elif shot and supports_reference:
+        # 用户显式勾选的资产不替他改选，但群像定妆照是例外：一张图里好几个人，
+        # 模型会照着那张图的人数复制角色（实测显式勾选单人+群像后画出两个主角）。
+        # 摘掉它属于「改写本次输入」，必须写进 reference_issues 让界面看得见。
+        group_refs = [
+            item for item in references if item.get("kind") == "actor" and item.get("group")
+        ]
+        if group_refs:
+            references = [
+                item
+                for item in references
+                if not (item.get("kind") == "actor" and item.get("group"))
+            ]
+            reference_policy_note = (
+                "已从本次参考图里剔除群像图："
+                + "、".join(str(item.get("name") or "") for item in group_refs)
+                + "。一张图里有多个人，模型会照它的人数复制角色；"
+                "要锁多个角色请各选一张单人定妆照。"
+            )
         previous = await _previous_shot_reference(session, shot)
         if previous and all(item["url"] != previous["url"] for item in references):
             if len(references) < 4:
@@ -1984,7 +2087,7 @@ async def _handle_image(session: AsyncSession, task: GenerationTask) -> dict[str
 
     # 同镜头多张关键帧的链式参考：第 N 张承接第 N-1 张的结尾状态
     chain_reference: dict | None = None
-    if supports_reference and is_new_keyframe and existing_kfs and not replaces_frame:
+    if supports_reference and is_new_keyframe and existing_kfs and not replaces_frame and not is_repair:
         chain_reference = await _media_reference(
             session,
             existing_kfs[-1].media_id,
@@ -2048,6 +2151,8 @@ async def _handle_image(session: AsyncSession, task: GenerationTask) -> dict[str
     # 没建档 / 定妆照没出 / 图拿不到公网地址，都会让该角色退回纯文字描述，
     # 这正是「关键帧不像本人」的根因。结果随关键帧一起存下来并在前端展示。
     reference_issues: list[str] = []
+    if reference_policy_note:
+        reference_issues.append(reference_policy_note)
     has_continuity_ref = append_mode or any(
         item.get("kind") == "continuity" for item in references
     )
@@ -2086,17 +2191,20 @@ async def _handle_image(session: AsyncSession, task: GenerationTask) -> dict[str
     keyframe_prompts = [str(item).strip() for item in (params.get("keyframe_prompts") or [])]
 
     created_assets: list = []
+    created_keyframe_ids: list[int] = []
     prev_clean: str | None = None
     used_any_reference = False
     for i in range(want_n):
         # 逐张提示词优先：批量时第 i 张用 keyframe_prompts[i]；未给则该张回落到基础提示词 + 阶段说明
         custom = keyframe_prompts[i] if i < len(keyframe_prompts) and keyframe_prompts[i] else ""
         round_base = custom or base_prompt
-        extra = None if is_asset_sheet else stage_hints.get(i)
+        # 修复候选沿用原构图，不能再叠加「起幅/中段/落幅」的阶段文案
+        extra = None if (is_asset_sheet or is_repair) else stage_hints.get(i)
+        repair_patch = str(params.get("repair_patch") or "").strip()
         if identity_extra:
             extra = f"{extra}\n{identity_extra}" if extra else identity_extra
         # 链式衔接：承接本镜头上一张的结尾状态（第一次承接已有最后一张，后续承接刚生成的上一张）
-        if is_new_keyframe and not replaces_frame:
+        if is_new_keyframe and not replaces_frame and not is_repair:
             prev_desc = prev_clean or (
                 (existing_kfs[-1].prompt or existing_kfs[-1].label or "").strip()
                 if existing_kfs
@@ -2125,17 +2233,24 @@ async def _handle_image(session: AsyncSession, task: GenerationTask) -> dict[str
         full_prompt = prompts.compose_generation_prompt(
             base=round_base,
             kind="image",
-            style=None if is_asset_sheet else style_text,
+            # 定妆照也要带项目画风：它是后续所有关键帧的图生图参考，
+            # 参考图是真人照片，画再多的「手绘动画」也会被参考图带回报写实风。
+            style=style_text,
             aspect_ratio=aspect_ratio,
             assets=assets,
             negative=params.get("negative_prompt"),
             continuity=continuity,
             extra=extra,
+            repair_patch=repair_patch,
             with_quality=not is_asset_sheet,
             references=round_references,
             empty_shot=empty_shot,
-            # 角色定妆 / 多视角设定图不带分镜上下文，本身很短，不必再走预算裁剪
+            # 角色定妆 / 多视角设定图不带分镜上下文，本身很短，不必再走预算裁剪。
+            # lean=False：定妆照的正文本来就长（外观 + 服装 + 构图指令），
+            # 而「三视图 / 头顶留白 / 灰背景」这段写在末尾，lean 的 300 字截断会把它整段切掉，
+            # 实测结果就是背景变成海边夕阳、三视图约束丢失。
             max_chars=None if is_asset_sheet else prompts.MAX_IMAGE_PROMPT_CHARS,
+            lean=not is_asset_sheet,
             **(shot_context if not is_asset_sheet else {}),
         )
         try:
@@ -2213,7 +2328,7 @@ async def _handle_image(session: AsyncSession, task: GenerationTask) -> dict[str
             auto_label = (
                 stage_labels[i] if i < len(stage_labels) else f"关键帧{len(existing_kfs) + i + 1}"
             )
-            await attach_generated_image(
+            keyframe = await attach_generated_image(
                 session,
                 shot=shot,
                 media_id=asset.id,
@@ -2227,6 +2342,7 @@ async def _handle_image(session: AsyncSession, task: GenerationTask) -> dict[str
                     want_n == 1 and not params.get("keyframe_id") and not params.get("append")
                 ),
             )
+            created_keyframe_ids.append(keyframe.id)
 
     if not created_assets:
         raise ProviderError("图片生成失败：未产出任何图片")
@@ -2238,13 +2354,20 @@ async def _handle_image(session: AsyncSession, task: GenerationTask) -> dict[str
         "kind": "image",
         "media_ids": [a.id for a in created_assets],
         "urls": [a.url for a in created_assets],
+        "keyframe_ids": created_keyframe_ids,
+        "keyframe_id": created_keyframe_ids[0] if created_keyframe_ids else None,
         "count": len(created_assets),
     }
 
     # 【AI 初审】单张关键帧出图后顺带做一次读图审查（只给建议，绝不自动认可）；
     # 多张批次（起幅/中段/落幅）不逐张调，避免一次生图产生多笔视觉调用。
-    # 审查失败只记日志，不影响生图任务本身。
-    if shot is not None and not is_asset_sheet and len(created_assets) == 1:
+    # 审查失败只记日志，不影响生图任务本身。修复 agent 自己会复审候选帧，这里跳过。
+    if (
+        shot is not None
+        and not is_asset_sheet
+        and not params.get("skip_auto_review")
+        and len(created_assets) == 1
+    ):
         from app.services.agents.visual_qa import maybe_review_keyframe
 
         review = await maybe_review_keyframe(
@@ -2369,6 +2492,7 @@ async def _handle_video(session: AsyncSession, task: GenerationTask) -> dict[str
         ),
         negative=params.get("negative_prompt"),
         continuity=await _video_continuity_block(session, shot) if shot else None,
+        repair_patch=params.get("repair_patch"),
         max_chars=prompts.MAX_VIDEO_PROMPT_CHARS,
         empty_shot=empty_shot,
         **shot_context,
@@ -2565,6 +2689,93 @@ async def _handle_edit(session, task):  # noqa: ANN001 - 与其它 handler 同�
     return await execute_edit(session, task)
 
 
+async def _handle_repair(session, task):  # noqa: ANN001 - 与其它 handler 同签名
+    """关键帧修复 agent：读初审 → 改提示词 → 重绘候选 → 复审，全程留 trace。
+
+    候选帧只追加、不替换旧帧，也不会被自动认可；批量生视频仍然只消费人工认可的帧。
+    """
+    from app.services.agents.repair import run_repair
+
+    params = task.params or {}
+    shot = await session.get(Shot, int(params["shot_id"])) if params.get("shot_id") else None
+    if shot is None:
+        raise ProviderError("修复任务缺少有效的分镜")
+    keyframe = (
+        await session.get(ShotKeyframe, int(params["keyframe_id"]))
+        if params.get("keyframe_id")
+        else None
+    )
+    if keyframe is None or keyframe.shot_id != shot.id:
+        raise ProviderError("修复任务缺少有效的关键帧")
+
+    return await run_repair(
+        session,
+        user_id=task.user_id,
+        shot=shot,
+        keyframe=keyframe,
+        task_id=task.id,
+        credential_id=params.get("credential_id"),
+        provider_key=params.get("provider") or task.provider,
+        model=params.get("model"),
+        max_rounds=params.get("max_rounds"),
+    )
+
+
+async def _handle_diagnosis(session: AsyncSession, task: GenerationTask) -> dict[str, Any]:
+    """失败诊断任务：只分析失败任务，默认不重跑。"""
+    from app.services.agents.diagnosis import run_diagnosis
+
+    params = task.params or {}
+    failed_task_id = params.get("failed_task_id")
+    if not failed_task_id:
+        raise ProviderError("诊断任务缺少 failed_task_id")
+    # 台账按 provider 聚合，诊断任务也要记下实际使用的文本厂商；
+    # 没有文本凭证时保持为空，由 run_diagnosis 如实返回「无法诊断」。
+    try:
+        diagnose_credential = await resolve_credential(
+            session, task.user_id, "text", params.get("credential_id"), params.get("provider")
+        )
+        task.provider = diagnose_credential.provider
+        task.model = params.get("model") or task.model
+    except ProviderError:
+        pass
+    return await run_diagnosis(
+        session,
+        user_id=task.user_id,
+        failed_task_id=int(failed_task_id),
+        allow_retry=bool(params.get("allow_retry")),
+        credential_id=params.get("credential_id"),
+        provider_key=params.get("provider"),
+        model=params.get("model"),
+        retry_credential_id=params.get("retry_credential_id"),
+        retry_provider_key=params.get("retry_provider"),
+        retry_model=params.get("retry_model"),
+    )
+
+
+async def _handle_cut_repair(session: AsyncSession, task: GenerationTask) -> dict[str, Any]:
+    """切点修复任务：默认只出视频提示词修正；重拍需显式开启。"""
+    from app.services.agents.cut_repair import run_cut_repair
+
+    params = task.params or {}
+    shot_id = params.get("shot_id") or task.shot_id
+    if not shot_id:
+        raise ProviderError("切点修复任务缺少分镜")
+    return await run_cut_repair(
+        session,
+        user_id=task.user_id,
+        shot_id=int(shot_id),
+        task_id=task.id,
+        allow_rerender=bool(params.get("allow_rerender")),
+        credential_id=params.get("credential_id"),
+        provider_key=params.get("provider"),
+        model=params.get("model"),
+        video_credential_id=params.get("video_credential_id"),
+        video_provider=params.get("video_provider"),
+        video_model=params.get("video_model"),
+    )
+
+
 _HANDLERS: dict[str, Callable[..., Any]] = {
     "text": _handle_text,
     "image": _handle_image,
@@ -2572,10 +2783,24 @@ _HANDLERS: dict[str, Callable[..., Any]] = {
     "export": _handle_export,
     "pipeline": _handle_pipeline,
     "edit": _handle_edit,
+    "repair": _handle_repair,
+    "diagnose": _handle_diagnosis,
+    "cut_repair": _handle_cut_repair,
 }
 
 
 # ---------------------------------------------------------------- 任务执行入口
+async def _refresh_template_overrides(session: AsyncSession) -> None:
+    """每个任务开始前同步一次已认可的模板覆盖：认可后无需重启 worker 即生效。"""
+    try:
+        from app.services.compiler_templates import load_active
+        from app.services.prompts import set_template_overrides
+
+        set_template_overrides(await load_active(session))
+    except Exception as exc:  # noqa: BLE001 - 模板覆盖是增强能力
+        logger.warning("模板覆盖刷新跳过：%s", exc)
+
+
 async def execute_task(task_id: int) -> None:
     async with AsyncSessionLocal() as session:
         task = await session.get(GenerationTask, task_id)
@@ -2587,6 +2812,7 @@ async def execute_task(task_id: int) -> None:
 
         # 提前快照：commit 会让 ORM 属性过期，flush 失败后再读会触发惰性加载而报错
         failed_shot_id = task.shot_id
+        failed_kind = task.kind
 
         task.status = "running"
         task.started_at = _now()
@@ -2598,7 +2824,10 @@ async def execute_task(task_id: int) -> None:
         if handler is None:
             await _finalize(session, task_id, status="failed", error=f"不支持的任务类型：{task.kind}")
             await _advance_chain(session, task_id, succeeded=False, error=f"不支持的任务类型：{task.kind}")
+            await _maybe_diagnose(session, task_id)
             return
+
+        await _refresh_template_overrides(session)
 
         try:
             result = await handler(session, task)
@@ -2608,16 +2837,29 @@ async def execute_task(task_id: int) -> None:
         except Exception as exc:  # noqa: BLE001 - 需落库为任务失败
             await session.rollback()
             message = str(exc) if isinstance(exc, ProviderError) else f"{type(exc).__name__}: {exc}"
-            if failed_shot_id:
+            # 修复失败不能把分镜打成 failed：旧关键帧仍然有效，失败只属于这次修复尝试
+            if failed_shot_id and failed_kind != "repair":
                 await session.execute(
                     update(Shot).where(Shot.id == failed_shot_id).values(status="failed")
                 )
             await _finalize(session, task_id, status="failed", error=message[:2000])
             await _advance_chain(session, task_id, succeeded=False, error=message[:500])
+            await _maybe_diagnose(session, task_id)
             return
 
         await _finalize(session, task_id, status="succeeded", result=result)
         await _advance_chain(session, task_id, succeeded=True)
+
+
+async def _maybe_diagnose(session: AsyncSession, task_id: int) -> None:
+    """任务失败后挂诊断 agent；任何异常都不能影响失败处理本身。"""
+    from app.services.agents.diagnosis import maybe_diagnose_failed_task
+
+    try:
+        await maybe_diagnose_failed_task(session, task_id)
+    except Exception as exc:  # noqa: BLE001 - 诊断是增强能力
+        logger.warning("任务 %s 自动诊断跳过：%s", task_id, exc)
+        await session.rollback()
 
 
 async def _advance_chain(
@@ -2807,6 +3049,8 @@ async def reap_stale_tasks(session: AsyncSession) -> dict[str, int]:
         task.status = "failed"
         task.finished_at = now
         task.error = "排队超时：任务从未被 worker 执行（队列可能已丢失），请重新发起"
+    for task in [*running, *pending]:
+        await _write_ledger(session, task.id, status="failed", result=None, error=task.error)
     await session.commit()
     for task in [*running, *pending]:
         await _advance_chain(session, task.id, succeeded=False, error=task.error)
@@ -2836,4 +3080,58 @@ async def _finalize(
         values["progress"] = 100
         values["result"] = result
     await session.execute(update(GenerationTask).where(GenerationTask.id == task_id).values(**values))
+    await _write_ledger(session, task_id, status=status, result=result, error=error)
     await session.commit()
+
+
+async def _write_ledger(
+    session: AsyncSession,
+    task_id: int,
+    *,
+    status: str,
+    result: dict | None,
+    error: str | None,
+) -> None:
+    """旁路台账：每个任务终态补一行。任何异常都不能影响任务本身的落库。"""
+    from app.models.ledger import GenerationLedger
+    from app.services import prompts as prompt_service
+
+    try:
+        row = (
+            await session.execute(
+                select(
+                    GenerationTask.user_id,
+                    GenerationTask.project_id,
+                    GenerationTask.shot_id,
+                    GenerationTask.kind,
+                    GenerationTask.provider,
+                    GenerationTask.model,
+                    GenerationTask.started_at,
+                    GenerationTask.finished_at,
+                ).where(GenerationTask.id == task_id)
+            )
+        ).first()
+        if row is None:
+            return
+        media_id = (result or {}).get("media_id")
+        duration_ms = None
+        if row.started_at and row.finished_at:
+            duration_ms = max(0, int((row.finished_at - row.started_at).total_seconds() * 1000))
+        session.add(
+            GenerationLedger(
+                task_id=task_id,
+                user_id=row.user_id,
+                project_id=row.project_id,
+                shot_id=row.shot_id,
+                kind=row.kind,
+                provider=row.provider,
+                model=row.model,
+                status=status,
+                media_id=int(media_id) if media_id else None,
+                duration_ms=duration_ms,
+                prompt_version=prompt_service.compiler_version(),
+                error=(error or None),
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 - 台账是旁路能力
+        logger.warning("任务 %s 台账写入跳过：%s", task_id, exc)

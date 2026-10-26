@@ -147,6 +147,41 @@ export interface VisualReview {
   reference_sheets?: number
 }
 
+/** 修复 agent 的一步：模型判断 + 工具调用 + 观察结果。 */
+export interface RepairTraceStep {
+  step: number
+  thought?: string
+  action: string
+  args?: Record<string, unknown>
+  ok: boolean
+  observation: string
+}
+
+export interface RepairResult {
+  action?: 'repair'
+  status:
+    | 'repaired'
+    | 'needs_human'
+    | 'escalated'
+    | 'agent_error'
+    | 'step_limit'
+    | 'already_pass'
+    | 'review_unavailable'
+    | string
+  steps?: number
+  stop_reason?: string
+  trace?: RepairTraceStep[]
+  initial_review?: VisualReview | null
+  review?: VisualReview | null
+  prompt_patch?: string
+  redraws?: number
+  candidate_keyframe_id?: number | null
+  candidate_media_id?: number | null
+  candidate_url?: string | null
+  message?: string
+  advisory?: boolean
+}
+
 export interface ShotKeyframe {
   id: number
   shot_id: number
@@ -189,6 +224,130 @@ export interface ContinuityReview {
   to_media_id: number
   reviewed_at: string
   /** 只给建议，不代替人工判断 */
+  advisory: boolean
+}
+
+/** 切点修复 agent 的结论：只给建议；只有显式开启时才重拍并替换下一镜视频。 */
+export interface CutRepairResult {
+  action?: 'cut_repair'
+  status:
+    | 'patch_only'
+    | 'repaired'
+    | 'improved'
+    | 'needs_human'
+    | 'already_pass'
+    | 'review_unavailable'
+    | 'agent_error'
+    | string
+  shot_id?: number
+  from_shot_id?: number
+  /** 针对失败项写出的视频提示词增量修正 */
+  patch?: string | null
+  before?: ContinuityReview | null
+  after?: ContinuityReview | null
+  /** 是否真的重拍了下一镜（会替换原视频） */
+  rerendered?: boolean
+  new_media_id?: number | null
+  notes?: string[]
+  summary?: string
+  allow_rerender?: boolean
+  model?: string
+  steps?: number
+  stop_reason?: string
+  trace?: RepairTraceStep[]
+  advisory?: boolean
+  message?: string
+  error?: string | null
+}
+
+/** 失败诊断 agent 给出的归因结论。 */
+export interface DiagnosisReport {
+  category: string
+  category_label: string
+  confidence: 'high' | 'medium' | 'low' | string
+  evidence: string[]
+  suggestion: string
+  retry_recommended: boolean
+}
+
+export interface CutRepairPayload {
+  /** 打开后 agent 才能重拍下一镜（会替换现有视频并产生费用） */
+  allow_rerender?: boolean
+  provider?: string | null
+  credential_id?: number | null
+  model?: string | null
+  video_provider?: string | null
+  video_credential_id?: number | null
+  video_model?: string | null
+}
+
+export interface DiagnosePayload {
+  /** 打开后 agent 才能换一套凭证重跑一次（会真实产生费用） */
+  allow_retry?: boolean
+  provider?: string | null
+  credential_id?: number | null
+  model?: string | null
+  retry_provider?: string | null
+  retry_credential_id?: number | null
+  retry_model?: string | null
+}
+
+export interface Diagnosis {
+  task_id: number
+  found: boolean
+  status?: string | null
+  model?: string | null
+  steps?: number
+  summary?: {
+    diagnosis?: DiagnosisReport
+    retry_task_id?: number | null
+    allow_retry?: boolean
+  } | null
+  trace?: RepairTraceStep[]
+  error?: string | null
+  created_at?: string | null
+}
+
+/** agent 运行审计记录：四个 agent 的结论与工具轨迹都留在这里。 */
+export interface AgentRun {
+  id: number
+  project_id?: number | null
+  kind: 'director' | 'diagnose' | 'cut_repair' | 'organize' | 'repair' | string
+  target_type?: string | null
+  target_id?: number | null
+  status?: string | null
+  model?: string | null
+  steps: number
+  stop_reason?: string | null
+  summary?: Record<string, any> | null
+  trace: RepairTraceStep[]
+  error?: string | null
+  advisory: boolean
+  created_at: string
+}
+
+export interface OrganizeSuggestion {
+  id: number
+  kind: string
+  severity: 'high' | 'medium' | 'low' | string
+  title: string
+  detail: string
+  target_ids: number[]
+}
+
+export interface OrganizeResult {
+  status: string
+  project_id?: number | null
+  scan: {
+    counts?: Record<string, any>
+    unlinked_examples?: { id: number; filename?: string; url?: string }[]
+    [key: string]: any
+  }
+  suggestions: OrganizeSuggestion[]
+  summary: string
+  model?: string | null
+  steps: number
+  trace: RepairTraceStep[]
   advisory: boolean
 }
 
@@ -261,12 +420,17 @@ export interface Shot {
   prompt_confirmed: boolean
   video_media_id?: number | null
   video_url?: string | null
+  /** 厂商降档说明（例如 Agnes 视频只出 720P），有值就要显示出来 */
+  video_note?: string | null
   /** 与上一镜的切点审查结论（AI 建议；视频没变时复用） */
   continuity_review?: ContinuityReview | null
   keyframes: ShotKeyframe[]
   /** 相邻镜头：生成关键帧 / 视频时会自动带入上下文，保障画面连续 */
   prev_shot?: ShotNeighbor | null
   next_shot?: ShotNeighbor | null
+  /** 本镜头最近一次生成时显式勾选的关联资产；弹窗重开时回填，空数组表示走自动绑定 */
+  last_image_asset_ids?: number[]
+  last_video_asset_ids?: number[]
 }
 
 /** 单字段 AI 生成：正文 + 镜头语言分层字段（景别/机位/运镜/构图/氛围/情绪） */
@@ -374,6 +538,8 @@ export interface EditCreatePayload {
   aspect_ratio: string
   pace: 'fast' | 'medium' | 'slow'
   instruction?: string | null
+  /** 成片归属项目；留空进「未归属素材」 */
+  project_id?: number | null
 }
 
 export interface EditResult {
@@ -383,9 +549,18 @@ export interface EditResult {
   title?: string | null
   segments: number
   aspect_ratio: string
+  project_id?: number | null
 }
 
-export type TaskKind = 'text' | 'image' | 'video' | 'export' | 'edit'
+export type TaskKind =
+  | 'text'
+  | 'image'
+  | 'video'
+  | 'export'
+  | 'edit'
+  | 'repair'
+  | 'diagnose'
+  | 'cut_repair'
 export type TaskStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'canceled'
 
 export interface GenerationTask {
@@ -607,6 +782,21 @@ export interface EpisodePlan {
   confirmed?: boolean
 }
 
+export interface ShotPlanIssue {
+  level: 'warn' | 'fail' | string
+  code: string
+  message: string
+}
+
+/** 导演自检 agent 的结论：结构性问题先由本地校验，必要时才调模型修订。 */
+export interface ShotPlanReview {
+  status: 'clean' | 'revised' | 'revised_with_warnings' | 'needs_human' | 'agent_error' | 'unavailable' | string
+  issues: ShotPlanIssue[]
+  revisions: number
+  trace: RepairTraceStep[]
+  message?: string | null
+}
+
 /** 「先规划」阶段 AI 给出的拆解建议：用户确认后才发起真正的拆解 */
 export interface ShotPlan {
   reasoning: string
@@ -616,6 +806,8 @@ export interface ShotPlan {
   target_seconds?: number
   beats: PlanBeat[]
   confirmed?: boolean
+  /** 导演自检结论（只建议，不阻断确认） */
+  review?: ShotPlanReview | null
 }
 
 export interface ShotPlanPayload {
@@ -625,6 +817,8 @@ export interface ShotPlanPayload {
   shot_count?: number | null
   target_seconds?: number | null
   style?: string | null
+  /** 是否在返回前跑导演自检（默认 true） */
+  review?: boolean
 }
 
 export interface ForgePayload {
@@ -636,4 +830,67 @@ export interface ForgePayload {
   shot_count?: number
   target_seconds?: number
   extra?: string | null
+}
+
+// ------------------------------ 质量看板 ------------------------------
+export interface QualityStats {
+  days: number
+  project_id?: number | null
+  total: number
+  succeeded: number
+  success_rate?: number | null
+  avg_duration_sec?: number | null
+  /** 平均耗时只统计成功任务：失败耗时取决于重试策略 */
+  avg_duration_basis: string
+  by_status: Record<string, number>
+  by_kind: Record<string, number>
+  by_provider: Record<string, { total: number; succeeded: number; failed: number }>
+  by_day: Record<string, { total: number; succeeded: number }>
+  review_verdicts: Record<string, number>
+  human_approved: number
+}
+
+export interface EvalRunSummary {
+  id: number
+  project_id: number
+  /** golden_shot=审现有主帧；golden_generate=按当前编译器重新出图 */
+  kind: string
+  status: string
+  prompt_version?: string | null
+  totals?: Record<string, number> | null
+  error?: string | null
+  created_at?: string | null
+}
+
+export interface EvalRunItem {
+  shot_id: number
+  media_id?: number | null
+  verdict?: string | null
+  prev_verdict?: string | null
+  changed?: boolean | null
+  checks?: Record<string, unknown> | null
+  reasons?: unknown
+  error?: string | null
+}
+
+export interface EvalRunDetail extends EvalRunSummary {
+  items: EvalRunItem[]
+}
+
+export interface KnowledgeNote {
+  id: number
+  scope: string
+  project_id?: number | null
+  category: string
+  title: string
+  content: string
+  preconditions?: Record<string, unknown> | null
+  visual_style?: string | null
+  status: string
+  approved: boolean
+  last_used_at?: string | null
+  last_confirmed_at?: string | null
+  superseded_by?: number | null
+  source_run_id?: number | null
+  created_at?: string | null
 }

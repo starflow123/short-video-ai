@@ -73,6 +73,60 @@ class GenerationRequest(BaseModel):
     template_variables: dict[str, str] | None = None
 
 
+class RepairRequest(BaseModel):
+    """关键帧修复 agent 请求：用视觉初审的失败项驱动重绘。"""
+
+    provider: str | None = None
+    credential_id: int | None = None
+    model: str | None = None
+    # 最多重绘几轮；留空用服务端配置，硬上限 3。
+    max_rounds: int | None = Field(default=None, ge=1, le=3)
+
+
+class DiagnoseRequest(BaseModel):
+    """失败诊断 agent 请求；默认只分析，不重跑。"""
+
+    # 打开后 agent 才能用另一套凭证重跑一次（会真实产生费用）
+    allow_retry: bool = False
+    # 诊断决策用的文本凭证；留空自动选择
+    provider: str | None = None
+    credential_id: int | None = None
+    model: str | None = None
+    # 重跑时希望使用的凭证 / 模型；留空自动选择
+    retry_provider: str | None = None
+    retry_credential_id: int | None = None
+    retry_model: str | None = None
+
+
+class DiagnosisRead(BaseModel):
+    """某条失败任务最近一次诊断结论（来自 agent_runs）。"""
+
+    task_id: int
+    found: bool = False
+    status: str | None = None
+    model: str | None = None
+    steps: int = 0
+    summary: dict | None = None
+    trace: list[dict] = Field(default_factory=list)
+    error: str | None = None
+    created_at: datetime | None = None
+
+
+class CutRepairRequest(BaseModel):
+    """切点修复 agent 请求；默认只给修正建议。"""
+
+    # 打开后 agent 才能重拍下一镜（会替换现有视频并产生费用）
+    allow_rerender: bool = False
+    # 决策用的文本凭证
+    provider: str | None = None
+    credential_id: int | None = None
+    model: str | None = None
+    # 重拍使用的视频凭证；留空自动选择
+    video_provider: str | None = None
+    video_credential_id: int | None = None
+    video_model: str | None = None
+
+
 class BreakdownRequest(BaseModel):
     """剧本拆解请求。"""
 

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import {
   App,
@@ -72,6 +72,16 @@ const PIPELINE_STATUS: Record<string, { text: string; color: string }> = {
   failed: { text: '失败', color: 'error' },
 }
 
+/** 导演自检 agent 的结论：结构问题先本地校验，必要时才调模型修订。 */
+const PLAN_REVIEW_STATUS: Record<string, { text: string; color: string }> = {
+  clean: { text: '结构校验通过', color: 'green' },
+  revised: { text: '已自动修订', color: 'blue' },
+  revised_with_warnings: { text: '已修订但仍需注意', color: 'orange' },
+  needs_human: { text: '建议人工检查', color: 'orange' },
+  agent_error: { text: '自检出错', color: 'red' },
+  unavailable: { text: '自检不可用', color: 'default' },
+}
+
 /** 项目资产分类：与后端 ASSET_KINDS 对齐，直接展示成图片卡片，方便回看与复用。 */
 const ASSET_TABS: { value: string; label: string; icon: ReactNode }[] = [
   { value: 'all', label: '全部', icon: <AppstoreOutlined /> },
@@ -116,6 +126,10 @@ export default function ProjectDetailPage() {
     auto_images?: boolean
   }>()
   const [breaking, setBreaking] = useState(false)
+  // 拆解是长任务：用常驻提示条而不是一闪而过的 toast，避免「点了没反应」
+  const [breakdownRunning, setBreakdownRunning] = useState(false)
+  const [breakdownResult, setBreakdownResult] = useState<Record<string, unknown> | null>(null)
+  const shotsAnchor = useRef<HTMLDivElement | null>(null)
   // 两步式拆解：先让 AI 出方案（不动镜头），用户确认或调整后再真正拆解
   const [shotPlan, setShotPlan] = useState<ShotPlan | null>(null)
   const [planning, setPlanning] = useState(false)
@@ -267,7 +281,11 @@ export default function ProjectDetailPage() {
   const { watch } = useTaskWatch((task) => {
     const forged = task.result?.action === 'forge'
     const broken = task.result?.action === 'breakdown'
+    const wasBreakdown = broken || task.params?.action === 'breakdown'
     const isPipeline = task.kind === 'pipeline'
+    if (wasBreakdown) {
+      setBreakdownRunning(false)
+    }
     if (task.status === 'failed') {
       message.error(`任务失败：${task.error ?? '未知错误'}`)
     } else if (task.kind === 'export') {
@@ -275,6 +293,7 @@ export default function ProjectDetailPage() {
     } else if (forged) {
       message.success(`「${task.result?.title ?? '新分集'}」已生成，共 ${task.result?.shot_count ?? 0} 个分镜`)
     } else if (broken) {
+      setBreakdownResult(task.result ?? null)
       const auto = Number(task.result?.auto_image_tasks ?? 0)
       const sheets = Number(task.result?.reference_tasks ?? 0)
       const made = Number(task.result?.shot_count ?? 0)
@@ -285,7 +304,12 @@ export default function ProjectDetailPage() {
           ? `，正在生成 ${sheets} 张角色定妆照；关键帧请到各镜头里逐张生成，满意后点「认可」`
           : '，角色定妆照已齐；关键帧请到各镜头里逐张生成，满意后点「认可」'
         : ''
-      message.success(`已按方案拆出 ${made} 个分镜${short}${imageNote}`)
+      const referenceError = String(task.result?.reference_error ?? '')
+      message.success(`已按方案拆出 ${made} 个分镜${short}${imageNote}${referenceError ? `。定妆照未生成：${referenceError}` : ''}`)
+      window.setTimeout(
+        () => shotsAnchor.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }),
+        400,
+      )
     } else if (isPipeline) {
       message.success('流水线已完成本步骤，可在下方查看角色档案与分镜')
     } else {
@@ -405,6 +429,8 @@ export default function ProjectDetailPage() {
       return
     }
     setBreaking(true)
+    setBreakdownRunning(true)
+    setBreakdownResult(null)
     try {
       const task = await episodeApi.breakdown(activeEpisode.id, {
         credential_id: values.credential_id,
@@ -414,9 +440,10 @@ export default function ProjectDetailPage() {
         auto_images: values.auto_images ?? false,
       })
       watch(task.id)
-      message.success('已提交分镜拆解，生成完成后自动刷新')
+      message.success('已提交分镜拆解，生成完成后自动刷新并跳到分镜列表')
       setBreakOpen(false)
     } catch (error) {
+      setBreakdownRunning(false)
       message.error(describeError(error))
     } finally {
       setBreaking(false)
@@ -893,6 +920,39 @@ export default function ProjectDetailPage() {
                 />
               </Card>
 
+              {breakdownRunning ? (
+                <Alert
+                  type="info"
+                  showIcon
+                  style={{ marginBottom: 12 }}
+                  message="正在 AI 拆解分镜…"
+                  description="这是长任务（模型要逐段展开），完成后会自动刷新并跳到分镜列表；可以先去别的页面，回来仍能看到结果。"
+                />
+              ) : breakdownResult ? (
+                <Alert
+                  type={breakdownResult.reference_error ? 'warning' : 'success'}
+                  showIcon
+                  closable
+                  onClose={() => setBreakdownResult(null)}
+                  style={{ marginBottom: 12 }}
+                  message={`上次拆解完成：${Number(breakdownResult.shot_count ?? 0)} 个分镜${
+                    Number(breakdownResult.planned_shots ?? 0) >
+                    Number(breakdownResult.shot_count ?? 0)
+                      ? `（方案要 ${Number(breakdownResult.planned_shots)} 镜）`
+                      : ''
+                  }`}
+                  description={
+                    <span>
+                      {Number(breakdownResult.auto_image_tasks ?? 0) > 0
+                        ? `已排入 ${Number(breakdownResult.reference_tasks ?? 0)} 张角色定妆照生成任务；`
+                        : '本次未勾选自动定妆照；'}
+                      {String(breakdownResult.reference_error ?? '') ||
+                        '关键帧请到各镜头里逐张生成，满意后点「认可」。'}
+                    </span>
+                  }
+                />
+              ) : null}
+
               {activeEpisode.plan && (
                 <Card
                   title="本次拆解分析"
@@ -929,7 +989,7 @@ export default function ProjectDetailPage() {
                 </Card>
               )}
 
-              <div>
+              <div ref={shotsAnchor}>
                 <div className="page-head" style={{ marginBottom: 12 }}>
                   <div>
                     <h3 style={{ margin: 0, fontSize: 16 }}>分镜列表</h3>
@@ -1247,6 +1307,38 @@ export default function ProjectDetailPage() {
               }
               description={shotPlan.reasoning || undefined}
             />
+            {shotPlan.review && (
+              <div>
+                <Space size={6} wrap>
+                  <Tag
+                    color={
+                      (PLAN_REVIEW_STATUS[shotPlan.review.status] ?? { color: 'default' }).color
+                    }
+                  >
+                    导演自检：
+                    {(PLAN_REVIEW_STATUS[shotPlan.review.status] ?? { text: shotPlan.review.status }).text}
+                  </Tag>
+                  {shotPlan.review.revisions > 0 && <Tag>修订 {shotPlan.review.revisions} 次</Tag>}
+                </Space>
+                {shotPlan.review.message && (
+                  <Typography.Paragraph type="secondary" style={{ fontSize: 12.5, margin: '6px 0 0' }}>
+                    {shotPlan.review.message}
+                  </Typography.Paragraph>
+                )}
+                {(shotPlan.review.issues ?? []).map((issue, index) => (
+                  <Alert
+                    key={`${issue.code}-${index}`}
+                    style={{ marginTop: 6 }}
+                    type={issue.level === 'fail' ? 'warning' : 'info'}
+                    showIcon
+                    message={issue.message}
+                  />
+                ))}
+                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                  自检只给建议，不改变这份方案；你可以直接调整分段镜头数后再拆解。
+                </Typography.Text>
+              </div>
+            )}
             {(shotPlan.beats ?? []).map((beat, index) => (
               <div className="plan-beat" key={`${beat.name}-${index}`}>
                 <Space align="start" style={{ width: '100%', justifyContent: 'space-between' }}>

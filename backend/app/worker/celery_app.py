@@ -30,5 +30,10 @@ celery_app.conf.update(
             "task": "tasks.reap_stale",
             "schedule": 300.0,
         },
+        # 教训库过期巡检：每天一次，只降级不删除
+        "sweep-knowledge": {
+            "task": "tasks.sweep_knowledge",
+            "schedule": 86400.0,
+        },
     },
 )

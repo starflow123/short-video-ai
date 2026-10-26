@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
 import {
+  Alert,
   App,
   Button,
   Card,
@@ -29,6 +30,7 @@ import {
   PictureOutlined,
   PlusOutlined,
   ReloadOutlined,
+  RobotOutlined,
   SearchOutlined,
   SkinOutlined,
   TeamOutlined,
@@ -37,11 +39,11 @@ import {
 } from '@ant-design/icons'
 import { useSearchParams } from 'react-router-dom'
 
-import { assetApi, mediaApi, projectApi, taskApi } from '@/api/endpoints'
+import { agentApi, assetApi, mediaApi, projectApi, taskApi } from '@/api/endpoints'
 import CredentialPicker from '@/components/CredentialPicker'
 import { useCredentials } from '@/hooks/useCredentials'
 import { describeError, mediaUrl } from '@/api/client'
-import type { AssetKind, MediaAsset, ProductionAsset, Project } from '@/api/types'
+import type { AssetKind, MediaAsset, OrganizeResult, ProductionAsset, Project } from '@/api/types'
 
 /** 资产类型：与后端 ASSET_KINDS 对齐。角色用来锁「同一个人」，场景 / 道具 / 服装锁环境与物件。 */
 const KIND_TABS: { value: string; label: string; icon: ReactNode }[] = [
@@ -57,6 +59,22 @@ const KIND_LABEL: Record<string, { text: string; color: string }> = {
   scene: { text: '场景', color: 'green' },
   prop: { text: '道具', color: 'orange' },
   costume: { text: '服装', color: 'purple' },
+}
+
+/** 素材整理 agent 的建议类别与严重度，只用于展示。 */
+const ORGANIZE_KIND_LABEL: Record<string, string> = {
+  duplicate_asset: '重名资产',
+  missing_media: '缺参考图',
+  missing_prompt: '缺外观描述',
+  unknown_subject: '未建档角色',
+  unknown_prop: '未建档道具',
+  unlinked_media: '未关联图片',
+}
+
+const ORGANIZE_SEVERITY: Record<string, { text: string; color: string }> = {
+  high: { text: '高', color: 'red' },
+  medium: { text: '中', color: 'orange' },
+  low: { text: '低', color: 'default' },
 }
 
 /** 卡片无参考图时的占位图标：按类型区分，方便一眼分辨角色 / 场景 / 道具 / 服装。 */
@@ -211,6 +229,12 @@ export default function AssetsPage() {
   const [genSaving, setGenSaving] = useState(false)
   const [genForm] = Form.useForm<AssetGenForm>()
   const [watchTaskId, setWatchTaskId] = useState<number | null>(null)
+
+  // 素材整理 agent：只读扫描 + 可选模型排序，结果仅展示，不写库
+  const [organizeOpen, setOrganizeOpen] = useState(false)
+  const [organizeUseLlm, setOrganizeUseLlm] = useState(true)
+  const [organizeBusy, setOrganizeBusy] = useState(false)
+  const [organizeResult, setOrganizeResult] = useState<OrganizeResult | null>(null)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -411,6 +435,31 @@ export default function AssetsPage() {
     }
   }
 
+  const openOrganize = () => {
+    setOrganizeResult(null)
+    setOrganizeUseLlm(true)
+    setOrganizeOpen(true)
+  }
+
+  const runOrganize = async () => {
+    setOrganizeBusy(true)
+    try {
+      const result = await agentApi.organizeAssets(
+        projectId === 'all' ? undefined : projectId,
+        { use_llm: organizeUseLlm },
+      )
+      setOrganizeResult(result)
+      if (!result.suggestions.length) message.success('素材库没有发现需要整理的问题')
+      else message.info(`扫描到 ${result.suggestions.length} 条整理建议（未改动任何素材）`)
+    } catch (error) {
+      message.error(describeError(error))
+    } finally {
+      setOrganizeBusy(false)
+    }
+  }
+
+  const organizeCounts: Record<string, any> = organizeResult?.scan?.counts ?? {}
+
   const filteredMedia = useMemo(() => {
     const text = pickerKeyword.trim().toLowerCase()
     if (!text) return mediaLibrary.slice(0, 60)
@@ -431,9 +480,14 @@ export default function AssetsPage() {
             即可让不同镜头里都是同一个人、同一个场景，画风与细节也保持一致。
           </p>
         </div>
-        <Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>
-          新增资产
-        </Button>
+        <Space>
+          <Button icon={<RobotOutlined />} onClick={openOrganize}>
+            AI 整理建议
+          </Button>
+          <Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>
+            新增资产
+          </Button>
+        </Space>
       </div>
 
       {/* 分类栏放在页面顶部最显眼处，并带数量，方便一眼看清每类各有多少 */}
@@ -500,6 +554,90 @@ export default function AssetsPage() {
           ))}
         </Row>
       )}
+
+      {/* 素材整理 agent：只读扫描重名 / 缺参考图 / 未建档角色 / 未关联图片，不写库 */}
+      <Modal
+        title="AI 整理素材库"
+        open={organizeOpen}
+        onCancel={() => setOrganizeOpen(false)}
+        width="min(720px, 94vw)"
+        destroyOnClose
+        footer={
+          <Space>
+            <Button onClick={() => setOrganizeOpen(false)}>关闭</Button>
+            <Button
+              type="primary"
+              icon={<RobotOutlined />}
+              loading={organizeBusy}
+              onClick={() => void runOrganize()}
+            >
+              {organizeResult ? '重新扫描' : '开始扫描'}
+            </Button>
+          </Space>
+        }
+      >
+        <Space direction="vertical" size={12} style={{ width: '100%' }}>
+          <Alert
+            type="info"
+            showIcon
+            message="agent 只读扫描，不会合并、删除或改写任何素材。"
+            description="扫描范围跟随上方项目筛选；选择「全部项目」时扫描全部资产。"
+          />
+          <Space size={10}>
+            <Switch size="small" checked={organizeUseLlm} onChange={setOrganizeUseLlm} />
+            <Typography.Text style={{ fontSize: 12.5 }}>
+              用文本模型排优先级并写总结（关闭则只做确定性扫描，不产生模型调用）
+            </Typography.Text>
+          </Space>
+          {organizeResult && (
+            <>
+              <Space size={6} wrap>
+                <Tag color={organizeResult.status === 'clean' ? 'green' : 'blue'}>
+                  {organizeResult.status === 'clean' ? '没有发现问题' : '整理建议'}
+                </Tag>
+                <Tag>资产 {Number(organizeCounts.assets ?? 0)}</Tag>
+                <Tag>镜头 {Number(organizeCounts.shots ?? 0)}</Tag>
+                <Tag>图片 {Number(organizeCounts.images ?? 0)}</Tag>
+                {organizeResult.model && <Tag>{organizeResult.model}</Tag>}
+                {organizeResult.steps > 0 && <Tag>步骤 {organizeResult.steps}</Tag>}
+              </Space>
+              <Alert type="success" showIcon message={organizeResult.summary} />
+              {organizeResult.suggestions.length === 0 ? (
+                <Empty
+                  image={Empty.PRESENTED_IMAGE_SIMPLE}
+                  description="没有需要整理的项目"
+                />
+              ) : (
+                organizeResult.suggestions.map((item) => (
+                  <Card key={item.id} size="small" styles={{ body: { padding: 10 } }}>
+                    <Space size={6} wrap style={{ marginBottom: 4 }}>
+                      <Tag color={(ORGANIZE_SEVERITY[item.severity] ?? { color: 'default' }).color}>
+                        {(ORGANIZE_SEVERITY[item.severity] ?? { text: item.severity }).text}
+                      </Tag>
+                      <Tag>{ORGANIZE_KIND_LABEL[item.kind] ?? item.kind}</Tag>
+                      <Typography.Text strong style={{ fontSize: 13 }}>
+                        {item.title}
+                      </Typography.Text>
+                    </Space>
+                    <Typography.Paragraph style={{ fontSize: 12.5, marginBottom: 4 }}>
+                      {item.detail}
+                    </Typography.Paragraph>
+                    {item.target_ids.length > 0 && (
+                      <Typography.Text type="secondary" style={{ fontSize: 11.5 }}>
+                        关联 #{item.target_ids.slice(0, 10).join(' / #')}
+                        {item.target_ids.length > 10 ? ' …' : ''}
+                      </Typography.Text>
+                    )}
+                  </Card>
+                ))
+              )}
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                以上只是建议：合并重名资产、补参考图、清理未关联图片都需要你手动操作。
+              </Typography.Text>
+            </>
+          )}
+        </Space>
+      </Modal>
 
       <Modal
         title={editing ? `编辑资产 · ${editing.name}` : '新增资产'}
@@ -636,6 +774,11 @@ export default function AssetsPage() {
             >
               <Switch />
             </Form.Item>
+          )}
+          {genAsset?.media_url && (
+            <Typography.Text type="secondary" style={{ display: 'block', marginTop: -8, marginBottom: 12 }}>
+              画风不对时请关掉这一项：旧参考图会把画法一路带回原样（实测真人照片参考图会压过「手绘动画」要求）。
+            </Typography.Text>
           )}
 
           <Row gutter={12}>

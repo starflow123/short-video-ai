@@ -829,6 +829,58 @@ def build_continuity_block(
 # 负面提示」的顺序拼装，让模型拿到的指令更完整、细节更足。
 
 
+# 「三花猫」这类非人形主体不是「人」。把他们一起计入人数时（实测文案：【人数】仅 小满、三花猫 2 人），
+# 模型照数补一个人类，画面上就多出第二个小满（项目 49 shot 215 / 216 实测）。人数约束只数人。
+_ANIMAL_NAME_STRONG = (
+    "猫", "狗", "犬", "狐", "狼", "虎", "狮", "豹", "熊", "蛇", "蟒", "鹰", "鸦", "鹊", "鸽",
+    "鹿", "猴", "猿", "鼠", "象", "龟", "蛙", "蛛", "蝎", "螂", "蟀",
+)
+# 这些字也常出现在人名 / 姓氏里（老马、牛大爷、小羊同学），只有外观描述佐证时才按动物处理
+_ANIMAL_NAME_WEAK = ("马", "牛", "羊", "猪", "鸡", "鸭", "鹅", "鱼", "兔", "驼", "貂", "蜜", "蝶", "蛾", "蚊")
+_ANIMAL_BODY_HINTS = (
+    "四足", "肉垫", "被毛", "竖瞳", "兽", "喵", "爪", "尾巴", "羽翼", "羽毛", "翅膀", "口器", "触须",
+)
+_HUMAN_MARKERS = ("男性", "女性", "人类", "少年", "少女", "成年男子", "成年女子")
+_HUMAN_NAME_SUFFIXES = (
+    "爷", "奶", "叔", "伯", "婶", "姨", "哥", "姐", "嫂", "弟", "妹", "娘", "生", "老师",
+    "同学", "师傅", "师父", "医生", "警官", "队长", "老板",
+)
+
+
+def is_nonhuman_subject(item: dict) -> bool:
+    """判断主体是不是非人形（猫狗兽禽一类），供人数约束把「人」和「动物」分开数。"""
+    name = str(item.get("name") or "").strip()
+    body = " ".join(
+        str(item.get(key) or "") for key in ("appearance", "description", "costume")
+    )
+    if any(marker in body for marker in _HUMAN_MARKERS) or any(
+        suffix in name for suffix in _HUMAN_NAME_SUFFIXES
+    ):
+        return False
+    if any(hint in name for hint in _ANIMAL_NAME_STRONG):
+        return True
+    if any(hint in name for hint in _ANIMAL_NAME_WEAK):
+        return any(hint in body for hint in _ANIMAL_BODY_HINTS)
+    # 名字里没有动物字样时，只有外观写得明确是兽类才按动物处理（猫常写作「狸花」「橘座」）
+    return sum(hint in body for hint in _ANIMAL_BODY_HINTS) >= 2
+
+
+def split_subject_names(
+    subjects: Sequence[dict] | None,
+) -> tuple[list[str], list[str]]:
+    """按出场顺序把主体拆成（人物名, 非人形主体名）；人数硬约束只对人物计数。"""
+    humans: list[str] = []
+    creatures: list[str] = []
+    for item in subjects or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        (creatures if is_nonhuman_subject(item) else humans).append(name)
+    return humans, creatures
+
+
 def build_subject_block(
     subjects: Sequence[dict] | None,
     props: Sequence[dict] | None = None,
@@ -926,25 +978,38 @@ def build_subject_block(
         for item in ordered
         if str(item.get("name") or "").strip()
     ]
+    # 人数只数「人」：猫、狗这类非人形主体进 count 会诱使模型补一个人类凑数（实测多画分身）
+    human_names, creature_names = split_subject_names(ordered)
     # 「群像学生 / 全班」这类资产是一个群体，不是一个角色：按人头数写死会把整班压成几个人。
     group_names = [
         name
-        for name in names
+        for name in human_names
         if any(hint in name for hint in ("群像", "众人", "人群", "全班", "学生们"))
     ]
-    single_names = [name for name in names if name not in group_names]
+    single_names = [name for name in human_names if name not in group_names]
+    creature_note = (
+        ""
+        if not creature_names
+        else f"{'、'.join(creature_names)} 是动物，按外观描述画成对应动物，不得拟人化或画成人，也不计入人数。"
+    )
     if lean:
         hand = "手指数量正确，不出现多余手臂。" if any(
             str(item.get("holds") or "").strip() for item in ordered
         ) else ""
-        if names and group_names:
+        if human_names and group_names:
             parts = []
             if single_names:
                 parts.append(f"{'、'.join(single_names)} 各 1 人")
             parts.append(f"{'、'.join(group_names)} 为群体")
             lines.append(f"【人数】{'；'.join(parts)}；不画分身与路人。{hand}")
-        elif names:
-            lines.append(f"【人数】仅 {'、'.join(names)} {len(names)} 人；不画分身与路人。{hand}")
+        elif human_names:
+            lines.append(
+                f"【人数】仅 {'、'.join(human_names)} {len(human_names)} 人；不画分身与路人。{hand}"
+            )
+        elif creature_names:
+            lines.append(f"【无人物】画面里没有人物，只有 {'、'.join(creature_names)}。")
+        if creature_note:
+            lines.append(creature_note)
         if empty_shot:
             lines.append("【空镜】不出现人、人影、剪影、手或身体部位。")
         elif unowned_props:
@@ -953,7 +1018,7 @@ def build_subject_block(
             )
         return "\n".join(lines)
 
-    if names and group_names:
+    if human_names and group_names:
         parts = []
         if single_names:
             parts.append(
@@ -968,12 +1033,19 @@ def build_subject_block(
             "每个单独角色只出现一次，不得出现同一角色的第二个分身、双胞胎、克隆体，"
             "也不得在背景里添加与主角长得相似的人。"
         )
-    elif names:
+    elif human_names:
         lines.append(
-            f"【人数硬约束】画面中只有 {len(names)} 名人物：{'、'.join(names)}。"
+            f"【人数硬约束】画面中只有 {len(human_names)} 名人物：{'、'.join(human_names)}。"
             "每个角色只出现一次，不得出现同一角色的第二个分身、双胞胎、克隆体，"
             "也不得在背景里添加与主角长得相似的人。"
         )
+    elif creature_names:
+        lines.append(
+            f"【人数硬约束】本镜头没有人物：画面中不得出现任何人、人影、剪影或身体部位，"
+            f"只按外观画出 {'、'.join(creature_names)}。"
+        )
+    if creature_note:
+        lines.append(creature_note)
     # 手持道具的镜头最容易多出一只脱离身体的手（实测成片里出现过第三只手）。
     # 只约束「数量与结构」，不能写「只画持物的那只手」——那会把合法的另一只手也压掉。
     if any(str(item.get("holds") or "").strip() for item in ordered):
@@ -1138,18 +1210,20 @@ def build_reference_count_check(references: Sequence[dict] | None, subjects: Seq
     """带连续性参考图时，在提示词末尾再数一次人头：模型最容易在这里把参考帧里的人多留一个。"""
     if not references or not any(str(item.get("kind") or "") == "continuity" for item in references):
         return ""
-    names = [
-        str(item.get("name") or "").strip()
-        for item in (subjects or [])
-        if isinstance(item, dict) and str(item.get("name") or "").strip()
-    ]
-    if len(names) < 2:
+    human_names, creature_names = split_subject_names(subjects)
+    if len(human_names) + len(creature_names) < 2:
         return ""
+    listed = "、".join(human_names + [f"{name}（动物）" for name in creature_names])
+    head = (
+        f"里面的人就是这 {len(human_names)} 位：{listed}。本图必须恰好 {len(human_names)} 个人"
+        if human_names
+        else f"里面的 {'、'.join(creature_names)} 就是本镜头的同一批动物，本图不得多出人物"
+    )
     return (
-        f"【人数复核】连续性参考图是本图之前一刻的同一场戏，里面的人就是这 {len(names)} 位："
-        f"{'、'.join(names)}。本图必须恰好 {len(names)} 个人，"
+        f"【人数复核】连续性参考图是本图之前一刻的同一场戏，{head}，"
         "参考图里谁坐着、谁站在哪里都不代表本图，凡与 subjects 描述冲突的姿态与位置一律改掉，"
-        "不得把参考图里的某个人留在原位、又另画一个同一个人。"
+        "不得把参考图里的某个人或某只动物留在原位、又按描述再画一个同类的"
+        + ("；动物一律画成动物，不得补成人类。" if creature_names else "。")
     )
 
 
@@ -1184,11 +1258,24 @@ def build_reference_legend(
             text += f"（{purpose}）"
         lines.append("- " + text)
     if lean:
-        lines.append(
-            "【参考图规则】按编号对应，不互换；只锁长相与服装，不复制背景站位；"
-            "参考图张数≠画面人数，人数以【人数】为准；同一角色只出现一次，不画分身。"
+        # 精简档压成一行：预算吃紧时多行图例最先被截成半句话，
+        # 而「图几是谁 + 张数≠人数」正是防分身的命门，宁可省字数也不能被截断。
+        parts = []
+        for index, item in enumerate(references, start=1):
+            kind = str(item.get("kind") or "")
+            name = str(item.get("name") or "").strip()
+            label = {
+                "actor": f"角色「{name}」",
+                "prop": f"道具「{name}」",
+                "continuity": "上一帧画面",
+                "identity": f"{name or '角色'}既有形象",
+            }.get(kind) or f"{name or '参考图'}"
+            parts.append(f"图{index}={label}")
+        return (
+            "【参考图】"
+            + " ".join(parts)
+            + "；只锁长相与服装，不复制背景站位；张数≠人数，人数以【人数】为准，同一角色只画一次。"
         )
-        return "\n".join(lines)
     if compact:
         lines.append(
             "【参考图规则】严格按编号对应角色与道具，不得互换、不得重复；"
@@ -1214,7 +1301,7 @@ def build_reference_legend(
 _SHEET_MARKERS = ("角色定妆参考图", "道具标准参考图", "场景参考图")
 
 
-def _strip_sheet_directives(text: str) -> str:
+def strip_sheet_directives(text: str) -> str:
     """砍掉资产 prompt 里「定妆参考图」那半句。
 
     资产 ``prompt`` 字段同时存了外观描述和参考图自己的构图指令（三视图、灰色背景纸）。
@@ -1251,7 +1338,7 @@ def build_asset_block(
             or item.get("description")
             or ""
         ).strip()
-        detail = _strip_sheet_directives(detail)
+        detail = strip_sheet_directives(detail)
         if compact and len(detail) > 90:
             detail = detail[:90].rstrip("，,；;、 ") + "…"
         if not name and not detail:
@@ -1382,6 +1469,65 @@ MAX_VIDEO_PROMPT_CHARS = 1150
 # 超限时先压解释性文字，quality（畸变底线）与 style（画风）不再被整块丢掉。
 MAX_IMAGE_PROMPT_CHARS = 820
 
+# RSI 白名单键：全局编译模板。agent 只能为这几个键提 patch（人工认可后生效），
+# 角色档、分镜模板等项目级资产永远不在白名单里。
+TEMPLATE_KEYS = (
+    "video_continuity_compact",
+    "video_negative_compact",
+    "image_negative_compact",
+)
+
+# 活跃模板覆盖：启动 / 认可后由 app.services.compiler_templates 装载，进程内缓存
+_TEMPLATE_OVERRIDES: dict[str, str] = {}
+
+
+def set_template_overrides(overrides: dict[str, str]) -> None:
+    """整表替换进程内覆盖；只接受白名单键，键不存在的内容一律忽略。"""
+    _TEMPLATE_OVERRIDES.clear()
+    for key, value in (overrides or {}).items():
+        if key in TEMPLATE_KEYS and str(value or "").strip():
+            _TEMPLATE_OVERRIDES[key] = str(value)
+
+
+def get_template_overrides() -> dict[str, str]:
+    return dict(_TEMPLATE_OVERRIDES)
+
+
+def _template(key: str, default: str) -> str:
+    return _TEMPLATE_OVERRIDES.get(key, default)
+
+
+def compiler_version() -> str:
+    """编译器指纹：参与提示词语义的所有函数源码的 sha1 前 12 位。
+
+    生成台账按它区分「同一个 prompt 版本内」的成功率；改了下面任何
+    一个函数（措辞、裁剪、块结构）指纹就变，成功率对比自动分段。
+    """
+    import hashlib
+    import inspect
+
+    parts = []
+    for name in (
+        compose_generation_prompt,
+        build_reference_legend,
+        build_reference_count_check,
+        build_state_block,
+        build_timeline_block,
+        build_quality_block,
+        build_negative_block,
+        build_continuity_block,
+        build_asset_block,
+        build_directives_block,
+    ):
+        try:
+            parts.append(inspect.getsource(name))
+        except (OSError, TypeError):
+            parts.append(name.__name__)
+    if _TEMPLATE_OVERRIDES:
+        # 生效中的模板覆盖参与指纹：同代码不同模板 = 不同 prompt 版本，台账分段要能看见
+        parts.append(json.dumps(_TEMPLATE_OVERRIDES, sort_keys=True, ensure_ascii=False))
+    return hashlib.sha1("\n".join(parts).encode("utf-8")).hexdigest()[:12]
+
 # base（video_prompt）里已经写成「0.0-3.0s：…」时，再拼一遍结构化时间轴就是同一批拍点写两份，
 # 实测同一句重复 350 字，直接挤掉正文后两段。这里用秒数区间判断是否已自带拍点。
 _BEAT_PATTERN = re.compile(r"\d+(?:\.\d+)?\s*[-–~至]\s*\d+(?:\.\d+)?\s*s")
@@ -1402,6 +1548,61 @@ _VIDEO_CONTINUITY_COMPACT = (
     "光线与色调与首帧及相邻镜头保持一致。"
 )
 
+_TEMPLATE_DEFAULTS = {
+    "video_continuity_compact": _VIDEO_CONTINUITY_COMPACT,
+    "video_negative_compact": _VIDEO_NEGATIVE_COMPACT,
+    "image_negative_compact": _IMAGE_NEGATIVE_COMPACT,
+}
+
+
+def template_content(key: str) -> str:
+    """当前生效内容：已认可覆盖优先，否则内置默认（RSI 提案 CLI 的基线）。"""
+    return _TEMPLATE_OVERRIDES.get(key, _TEMPLATE_DEFAULTS.get(key, ""))
+
+# 项目画风写的是「质感」（如「日系手绘动画质感」），但图片模型默认仍是真人照片：
+# 实测这种写法被画成真人 cos 照片，后续关键帧拿它当参考图就一路写实到底。
+# 非写实画法必须显式声明「画法媒介」并把照片质感词压进负面词，二者缺一不可。
+# 顺序即优先级：「3D 动画」同时含「动画」，要先判 3D 才不会被误判成 2D 赛璐璐。
+_MEDIUM_RULES: tuple[tuple[tuple[str, ...], str, str], ...] = (
+    (("3d", "三维", "皮克斯"),
+     "3D 动画渲染：风格化材质与打光，明显是渲染出来的动画而非真人实拍",
+     "photo, photograph, photorealistic, live action, 2d drawing"),
+    (("动漫", "动画", "手绘", "赛璐璐", "二次元", "新海诚"),
+     "2D 手绘动画赛璐璐上色：清晰描线、平涂色块加少量渐变，非真人照片",
+     "photo, photograph, photorealistic, realistic skin texture, live action, 3d render"),
+    (("水墨",),
+     "中国水墨手绘：宣纸纹理、墨色晕染与留白，非真人照片",
+     "photo, photograph, photorealistic, 3d render"),
+    (("油画",),
+     "厚涂油画：可见笔触与画布纹理，非真人照片",
+     "photo, photograph, photorealistic, 3d render"),
+    (("卡通",),
+     "2D 卡通：粗描线平涂、头身比略夸张，非真人照片",
+     "photo, photograph, photorealistic, 3d render"),
+)
+
+
+def style_medium_rule(style: str | None) -> tuple[str, str] | None:
+    """画风文案对应的「画法媒介」：返回 (媒介声明, 需排除的照片质感词)。
+
+    现实 / 复古胶片 / 赛博朋克这类本来就是照片质感的画风返回 None，不添加限制。
+    """
+    text = (style or "").lower()
+    for keywords, medium, negative in _MEDIUM_RULES:
+        if any(keyword in text for keyword in keywords):
+            return medium, negative
+    return None
+
+
+def _dedupe_terms(text: str) -> str:
+    """逗号分隔的负面词去重，保留首次出现顺序（自定义词与内置词会撞车）。"""
+    seen: list[str] = []
+    for part in text.split(","):
+        term = part.strip()
+        if term and term.lower() not in {item.lower() for item in seen}:
+            seen.append(term)
+    return ", ".join(seen)
+
 
 def build_negative_block(
     negative: str | None = None,
@@ -1409,12 +1610,14 @@ def build_negative_block(
     kind: str = "image",
     compact: bool = False,
     lean: bool = False,
+    extra: str | None = None,
 ) -> str:
     """负面提示段落：默认使用内置中英关键词列表，传空串表示不追加。
 
     自定义负面词只做「追加」，不能替换内置列表——内置的 bad anatomy / extra limbs /
     deformed 是压住畸形人体与多余肢体的底线，一旦被替换掉，画面立刻出现非人类结构。
     视频另加一组「中途换场景 / 多出人物」的失效模式，图生视频最容易在这里崩。
+    ``extra`` 是与画风绑定的追加项（如非写实画风的照片质感词），与自定义词同层。
 
     ``compact=True`` 用于预算吃紧时：视频只保留覆盖畸形 / 多手 / 分身 / 换场 / 文字的短清单，
     图片只保留形体 / 多手 / 分身 / 画质 / 文字的底线项，避免整段负面词把正文挤掉。
@@ -1423,22 +1626,24 @@ def build_negative_block(
         return ""
     if compact:
         if kind == "video":
-            pool = _VIDEO_NEGATIVE_COMPACT
+            pool = _template("video_negative_compact", _VIDEO_NEGATIVE_COMPACT)
         else:
-            pool = _IMAGE_NEGATIVE_COMPACT
-        custom = (negative or "").strip()
+            pool = _template("image_negative_compact", _IMAGE_NEGATIVE_COMPACT)
+        custom = ", ".join(part for part in ((negative or "").strip(), (extra or "").strip()) if part)
         text = f"{custom}, {pool}" if custom else pool
         header = "【负面提示】" if lean else "【负面提示（以下内容禁止出现）】"
-        return f"{header}\n{text}"
+        return f"{header}\n{_dedupe_terms(text)}"
     if negative is None:
         parts = [DEFAULT_NEGATIVE]
     else:
         parts = [negative.strip()]
         if DEFAULT_NEGATIVE not in negative:
             parts.append(DEFAULT_NEGATIVE)
-    text = ", ".join(parts)
+    if extra and extra.strip():
+        parts.append(extra.strip())
+    text = _dedupe_terms(", ".join(parts))
     if kind == "video" and VIDEO_NEGATIVE not in text:
-        text = f"{text}, {VIDEO_NEGATIVE}"
+        text = _dedupe_terms(f"{text}, {VIDEO_NEGATIVE}")
     return f"【负面提示（以下内容禁止出现）】\n{text}"
 
 
@@ -1478,6 +1683,7 @@ def compose_generation_prompt(
     negative: str | None = None,
     continuity: str | None = None,
     extra: str | None = None,
+    repair_patch: str | None = None,
     with_quality: bool = True,
     subjects: Sequence[dict] | None = None,
     props: Sequence[dict] | None = None,
@@ -1504,6 +1710,7 @@ def compose_generation_prompt(
     - ``assets``：关联资产列表（dict：kind / name / prompt / description）
     - ``continuity``：前后镜头衔接说明
     - ``extra``：额外的本张补充要求（如「起幅 / 中段 / 落幅」的阶段说明）
+    - ``repair_patch``：修复 agent 的增量修正；独立成块并受预算保护，不会被正文裁剪吞掉
     - ``max_chars``：厂商提示词长度硬上限；超长时按优先级精简（见下方注释）
     """
     tagged: list[tuple[str, str]] = []
@@ -1512,13 +1719,30 @@ def compose_generation_prompt(
         if text and text.strip():
             tagged.append((tag, text.strip()))
 
+    # 画风决定要不要额外排除「真人照片」质感：非写实画法光靠质感词压不住模型默认倾向
+    medium = style_medium_rule(style)
+
     # 正文是模型注意力最集中的一段，但它超过 300 字后后半段基本被忽略；
     # 先按句边界收在 300 字内，避免后面的硬约束层被预算裁剪整块丢掉。
     if lean and base and len(base) > 300:
         base = _truncate_at_boundary(base, 300)
     add("base", base)
+    # 修复指令是这一张唯一必须生效的内容：放在正文之后单独成块，
+    # 预算裁剪时与硬约束同属受保护层，只会压缩别处和正文。
+    add(
+        "repair",
+        f"【本次修正】{repair_patch.strip()}。"
+        "除这条修正外，画面内容、人物身份与道具归属保持不变。"
+        if repair_patch and repair_patch.strip()
+        else None,
+    )
     if style and style.strip():
-        add("style", f"【风格收束】{style.strip()}")
+        add(
+            "style",
+            f"【画风硬要求】画法必须是：{medium[0]}。{style.strip()}"
+            if medium
+            else f"【风格收束】{style.strip()}",
+        )
     # 视频的动作由时间轴逐拍负责，人物卡不再重复 action，避免同一句话占两份预算。
     add(
         "subjects",
@@ -1576,7 +1800,13 @@ def compose_generation_prompt(
     add("count_check", build_reference_count_check(references, subjects))
     add(
         "negative",
-        build_negative_block(negative, kind=kind, compact=(kind == "video" or lean), lean=lean),
+        build_negative_block(
+            negative,
+            kind=kind,
+            compact=(kind == "video" or lean),
+            lean=lean,
+            extra=medium[1] if medium else None,
+        ),
     )
 
     if max_chars is not None:
@@ -1646,7 +1876,7 @@ def compose_generation_prompt(
             # 正文已经按第一个动作拍点定格，时间轴块是同一批动作的第二份拷贝
             drop_block("timeline")
         if kind == "video" and total_chars() > max_chars:
-            replace_block("continuity", _VIDEO_CONTINUITY_COMPACT)
+            replace_block("continuity", _template("video_continuity_compact", _VIDEO_CONTINUITY_COMPACT))
         if total_chars() > max_chars:
             # 优先压缩非正文块：正文承载全部动作语义，一旦被切，模型只能自行脑补，
             # 表现就是画面跳变、动作没有来由。先削最长的约束块，削到没意义了整块丢弃。
@@ -1655,6 +1885,7 @@ def compose_generation_prompt(
             # 「谁在画面里、谁拿什么、几个人」就没人管了，人物一致性会当场崩掉。
             protected = {
                 "base",
+                "repair",
                 "style",
                 "directives",
                 "subjects",
@@ -1683,8 +1914,10 @@ def compose_generation_prompt(
                     continue
                 tagged[index] = (tagged[index][0], _truncate_at_boundary(text, target))
         if total_chars() > max_chars:
-            # 极端兜底：非正文块已无可压缩，才压缩镜头语言，最后才动正文（按句边界截）。
-            for tag_name in ("directives", "legend", "negative", "count_check"):
+            # 极端兜底：非正文块已无可压缩，才压缩镜头语言与负面词，图例与人数块排最后。
+            # 把它们截成半句话等于丢掉「图几是谁、画面几个人」，实测模型会照参考图把人复制成两个；
+            # 保不住完整语义时整块丢弃，让前端的「这一层没进最终提示词」明确告警。
+            for tag_name in ("directives", "negative", "quality", "legend", "count_check"):
                 if total_chars() <= max_chars:
                     break
                 rest = [(i, text) for i, (t, text) in enumerate(tagged) if t == tag_name]
@@ -1692,7 +1925,8 @@ def compose_generation_prompt(
                     continue
                 index, text = rest[0]
                 target = len(text) - (total_chars() - max_chars)
-                if target < 20:
+                floor = 60 if tag_name in ("legend", "count_check") else 20
+                if target < floor:
                     drop_block(tag_name)
                     continue
                 tagged[index] = (tagged[index][0], _truncate_at_boundary(text, target))

@@ -176,9 +176,165 @@ def test_empty_shot_treats_person_checks_as_not_applicable():
         model="deepseek-flash",
         media_id=9,
         subject_count=0,
+        has_style=False,
     )
 
     assert review["checks"]["face_match"] == "pass"
     assert review["checks"]["costume_match"] == "pass"
     assert review["checks"]["duplicate_person"] == "pass"
+    # 项目没填视觉风格：画风一项不适用，不能算成风险
+    assert review["checks"]["style_match"] == "pass"
     assert review["verdict"] == "pass"
+
+
+def test_photoreal_frame_fails_hand_drawn_style():
+    """实测缺口：要求「手绘动画」却出成真人照片，之前没有任何检查项会报出来。"""
+    prompt = visual_qa.build_review_prompt(
+        SimpleNamespace(
+            title="站牌下的成绩单",
+            description="小满坐在木长椅上低头看成绩单",
+            image_prompt="小满低头看成绩单",
+            camera=None,
+            directives={"shot_size": "中景"},
+            subjects=[{"name": "小满", "costume": "米色针织开衫"}],
+            props=[],
+        ),
+        image_labels=["图1：待审关键帧"],
+        visual_style="日系手绘动画质感，柔光逆光",
+    )
+    assert "日系手绘动画质感，柔光逆光" in prompt
+    assert "style_match" in prompt
+
+    review = visual_qa.normalize_review(
+        {
+            "verdict": "pass",
+            "checks": {
+                "face_match": "pass",
+                "costume_match": "pass",
+                "cast_count": "pass",
+                "prop_holder": "pass",
+                "duplicate_person": "pass",
+                "composition": "pass",
+                "style_match": "fail",
+            },
+            "reasons": ["要求手绘动画，画面是真人照片"],
+        },
+        provider="deepseek",
+        model="deepseek-flash",
+        media_id=9,
+        subject_count=1,
+        has_style=True,
+    )
+
+    assert review["checks"]["style_match"] == "fail"
+    assert review["verdict"] == "fail"
+
+
+def test_review_without_style_omits_style_rule():
+    prompt = visual_qa.build_review_prompt(
+        SimpleNamespace(
+            title="空镜",
+            description="夜色里的站牌",
+            image_prompt="空镜",
+            camera=None,
+            directives={},
+            subjects=[],
+            props=[],
+        ),
+        image_labels=["图1：待审关键帧"],
+        visual_style=None,
+    )
+
+    assert "style_match" not in prompt
+
+
+class _Scalars:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def all(self):
+        return self._rows
+
+
+class _Result:
+    def scalars(self):
+        return _Scalars([])
+
+
+class _AuditSession:
+    """只满足 review_keyframe 的取数与写入，用来断言审计落库。"""
+
+    def __init__(self, episode):
+        self.episode = episode
+        self.added: list = []
+
+    async def get(self, model, pk):  # noqa: ANN001 - 测试替身
+        return self.episode if getattr(model, "__name__", "") == "Episode" else None
+
+    async def execute(self, _stmt):
+        return _Result()
+
+    def add(self, obj) -> None:
+        self.added.append(obj)
+
+    async def flush(self) -> None:
+        return None
+
+
+def test_review_keyframe_also_writes_audit_run(monkeypatch):
+    from app.models.agent_run import AgentRun
+    from app.services import generation, storage
+
+    class _Provider:
+        def supports(self, capability: str) -> bool:
+            return capability == "vision"
+
+        def model_for(self, capability: str) -> str:
+            return "deepseek-flash"
+
+        async def generate_vision(self, prompt, *, images, system, json_mode, max_tokens):
+            return (
+                '{"verdict":"pass","checks":{"face_match":"pass","cast_count":"pass",'
+                '"prop_holder":"pass","composition":"pass"},"reasons":[]}'
+            )
+
+    async def fake_resolve(*args, **kwargs):
+        return SimpleNamespace(id=3, provider="deepseek")
+
+    monkeypatch.setattr(generation, "resolve_credential", fake_resolve)
+    monkeypatch.setattr(generation, "build_provider_from", lambda credential: _Provider())
+
+    async def fake_bytes(media):
+        return b"\x89PNG\r\n\x1a\nframe"
+
+    monkeypatch.setattr(storage, "asset_bytes", fake_bytes)
+
+    shot = SimpleNamespace(
+        id=5,
+        episode_id=7,
+        title="午后教室",
+        description="两名男生对坐",
+        image_prompt="午后教室",
+        camera=None,
+        directives={},
+        subjects=[],
+        props=[],
+    )
+    asset = SimpleNamespace(id=11, meta={})
+    session = _AuditSession(SimpleNamespace(id=7, project_id=9))
+
+    review = asyncio.run(
+        visual_qa.review_keyframe(session, user_id=1, asset=asset, shot=shot)
+    )
+
+    assert review["verdict"] == "pass"
+    run = session.added[-1]
+    assert isinstance(run, AgentRun)
+    assert run.kind == "visual_review"
+    assert run.status == "pass"
+    assert run.project_id == 9
+    assert run.target_type == "media"
+    assert run.target_id == 11
+    assert run.steps == 1
+    assert run.summary["shot_id"] == 5
+    assert run.summary["checks"]["face_match"] == "pass"

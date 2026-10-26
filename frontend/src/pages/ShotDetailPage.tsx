@@ -36,6 +36,7 @@ import {
   StarFilled,
   StarOutlined,
   TeamOutlined,
+  ToolOutlined,
   VideoCameraAddOutlined,
 } from '@ant-design/icons'
 import { useNavigate, useParams } from 'react-router-dom'
@@ -48,9 +49,12 @@ import { assetApi, projectApi, shotApi } from '@/api/endpoints'
 import { useCredentials } from '@/hooks/useCredentials'
 import { useTaskWatch } from '@/hooks/useTaskWatch'
 import type {
+  CutRepairResult,
   ProductionAsset,
   Project,
   PromptPreview,
+  RepairResult,
+  RepairTraceStep,
   Shot,
   ShotActionBeat,
   ShotFieldKey,
@@ -89,6 +93,7 @@ const REVIEW_CHECKS: { key: string; label: string }[] = [
   { key: 'prop_holder', label: '道具归属' },
   { key: 'duplicate_person', label: '有无分身' },
   { key: 'composition', label: '构图景别' },
+  { key: 'style_match', label: '画风一致' },
 ]
 
 const REVIEW_VERDICT: Record<string, { text: string; color: string }> = {
@@ -102,6 +107,76 @@ const REVIEW_CHECK_STATUS: Record<string, { text: string; color: string }> = {
   warn: { text: '注意', color: 'orange' },
   fail: { text: '不通过', color: 'red' },
   unknown: { text: '看不清', color: 'default' },
+}
+
+/** 修复 agent 的结果状态与工具名，用于轨迹弹窗。 */
+const REPAIR_STATUS: Record<string, { text: string; color: string }> = {
+  repaired: { text: '候选帧复审通过', color: 'green' },
+  needs_human: { text: '需要人工判断', color: 'orange' },
+  escalated: { text: '已转人工', color: 'orange' },
+  already_pass: { text: '初审已通过', color: 'green' },
+  review_unavailable: { text: '无法取得初审', color: 'default' },
+  agent_error: { text: 'agent 出错', color: 'red' },
+  step_limit: { text: '达到步数上限', color: 'orange' },
+}
+
+/** 切点修复 agent 的结果状态。 */
+const CUT_REPAIR_STATUS: Record<string, { text: string; color: string }> = {
+  patch_only: { text: '已给出修正建议', color: 'blue' },
+  repaired: { text: '重拍后复审通过', color: 'green' },
+  improved: { text: '重拍后有改善', color: 'cyan' },
+  needs_human: { text: '需要人工判断', color: 'orange' },
+  already_pass: { text: '审查已通过', color: 'green' },
+  review_unavailable: { text: '无法取得审查', color: 'default' },
+  agent_error: { text: 'agent 出错', color: 'red' },
+}
+
+const REPAIR_TOOL_LABEL: Record<string, string> = {
+  inspect: '读取镜头约束',
+  patch_prompt: '修改提示词',
+  redraw: '重绘候选帧（计费）',
+  review_candidate: '复审候选帧',
+  rerender_video: '重拍本镜视频（计费）',
+  recheck_cut: '复审切点',
+  report: '记录结论',
+  escalate: '转人工',
+  finish: '结束',
+  decide: '模型决策',
+  invalid: '输出格式错误',
+}
+
+/** agent 轨迹列表：修复 / 切点修复共用同一套渲染。 */
+function TraceList({ steps, emptyText }: { steps?: RepairTraceStep[]; emptyText: string }) {
+  if (!steps || steps.length === 0) {
+    return <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={emptyText} />
+  }
+  return (
+    <Space direction="vertical" size={8} style={{ width: '100%' }}>
+      {steps.map((step, index) => (
+        <Card key={`${step.step}-${index}`} size="small" styles={{ body: { padding: 10 } }}>
+          <Space size={6} wrap style={{ marginBottom: 4 }}>
+            <Tag>第 {step.step} 步</Tag>
+            <Tag color={step.ok ? 'blue' : 'red'}>
+              {REPAIR_TOOL_LABEL[step.action] ?? step.action}
+            </Tag>
+            {step.args && Object.keys(step.args).length > 0 ? (
+              <Typography.Text type="secondary" style={{ fontSize: 11.5 }}>
+                {JSON.stringify(step.args)}
+              </Typography.Text>
+            ) : null}
+          </Space>
+          {step.thought ? (
+            <Typography.Paragraph style={{ marginBottom: 4, fontSize: 12.5 }}>
+              判断：{step.thought}
+            </Typography.Paragraph>
+          ) : null}
+          <Typography.Paragraph type="secondary" style={{ marginBottom: 0, fontSize: 12 }}>
+            观察：{step.observation}
+          </Typography.Paragraph>
+        </Card>
+      ))}
+    </Space>
+  )
 }
 
 /** 切点审查的检查项：只比人 / 服装 / 场景 / 光线与首帧，姿态突变不算问题。 */
@@ -241,7 +316,16 @@ export default function ShotDetailPage() {
   const [confirming, setConfirming] = useState(false)
   const [approveBusyId, setApproveBusyId] = useState<number | null>(null)
   const [reviewBusyId, setReviewBusyId] = useState<number | null>(null)
+  const [repairBusyId, setRepairBusyId] = useState<number | null>(null)
+  const [repairResult, setRepairResult] = useState<RepairResult | null>(null)
+  const [repairOpen, setRepairOpen] = useState(false)
   const [continuityBusy, setContinuityBusy] = useState(false)
+
+  // 切点修复 agent：默认只出提示词修正；勾选后才允许重拍本镜视频（会替换现有视频）
+  const [cutRepairOpen, setCutRepairOpen] = useState(false)
+  const [cutRepairBusy, setCutRepairBusy] = useState(false)
+  const [cutRepairAllow, setCutRepairAllow] = useState(false)
+  const [cutRepairResult, setCutRepairResult] = useState<CutRepairResult | null>(null)
 
   // 结构化镜头上下文：AI 拆解产出的事实（谁拿什么、几秒做什么），可在这里就地纠正。
   // 生成时按它选参考图、拼主体绑定与时间轴，所以改完不必重跑整集拆解。
@@ -325,6 +409,35 @@ export default function ShotDetailPage() {
   const { watch } = useTaskWatch((task) => {
     if (task.status === 'failed') {
       message.error(`任务失败：${task.error ?? '未知错误'}`)
+    } else if (task.kind === 'repair') {
+      // 修复 agent 的完整决策轨迹留在弹窗里，方便判断它改了什么、为什么没修好
+      const result = (task.result || null) as RepairResult | null
+      setRepairResult(result)
+      setRepairOpen(true)
+      if (result?.status === 'repaired') {
+        message.success('AI 修复完成：候选帧复审通过，请对比后自己认可')
+      } else if (result?.status === 'already_pass') {
+        message.info('初审已通过，不需要修复；认可仍由你决定')
+      } else if (result?.status === 'review_unavailable') {
+        message.warning(result.message || '无法取得视觉初审，已转人工')
+      } else {
+        message.warning('AI 修复未完全通过，候选帧与轨迹已留给你判断')
+      }
+    } else if (task.kind === 'cut_repair') {
+      const result = (task.result || null) as CutRepairResult | null
+      setCutRepairResult(result)
+      setCutRepairOpen(true)
+      if (result?.rerendered) {
+        message.success('切点修复完成：已重拍本镜并复审，请确认新视频')
+      } else if (result?.status === 'patch_only') {
+        message.info('AI 给了视频提示词修正，未重拍；可按建议手动重跑')
+      } else if (result?.status === 'already_pass') {
+        message.info('切点审查已通过，不需要修复')
+      } else {
+        message.warning('切点修复未完全通过，结论与轨迹已留给你判断')
+      }
+    } else if (task.kind === 'diagnose') {
+      message.info('失败诊断已完成，可在任务页查看结论')
     } else {
       message.success(task.kind === 'video' ? '视频已生成' : '关键帧已生成')
     }
@@ -381,6 +494,59 @@ export default function ShotDetailPage() {
         .map((item) => ({ value: item.id, label: `#${item.id} ${item.name}` })),
     [assets],
   )
+
+  /** 不显式勾选时，后端会按本镜 subjects / props 的名称自动匹配这些资产的参考图。 */
+  const autoBoundAssets = useMemo(() => {
+    if (!shot) return []
+    const matched = (kind: string, names: (string | null | undefined)[]) => {
+      const picked = new Set(names.map((name) => (name ?? '').trim()).filter(Boolean))
+      if (!picked.size) return []
+      return assets.filter((asset) => asset.kind === kind && picked.has(asset.name.trim()))
+    }
+    const subjectNames = (shot.subjects ?? []).map((item) => item.name)
+    const propNames = (shot.props ?? []).map((item) => item.name)
+    // 与后端一致：旧分镜没有结构化主体时，角色参考会回退到全部角色资产
+    const actors = subjectNames.length
+      ? matched('actor', subjectNames)
+      : assets.filter((asset) => asset.kind === 'actor')
+    const all = [
+      ...actors,
+      ...matched('prop', propNames),
+      ...assets.filter((asset) => asset.kind === 'scene'),
+    ]
+    const seen = new Set<number>()
+    return all.filter((asset) => (seen.has(asset.id) ? false : (seen.add(asset.id), true)))
+  }, [shot, assets])
+
+  const kfAssetSelection = Form.useWatch('asset_ids', kfForm)
+  const videoAssetSelection = Form.useWatch('asset_ids', videoForm)
+
+  const autoAssetIds = useMemo(() => autoBoundAssets.map((asset) => asset.id), [autoBoundAssets])
+
+  /**
+   * 勾选结果与自动匹配完全一致（或全清空）时按「自动」提交。
+   * 后端见到非空 asset_ids 就不再走「同一场戏只接上一帧锁脸」那套参考策略，
+   * 所以不能把自动带出的那批原样发回去，否则用户只是没动下拉框就丢掉了防分身策略。
+   */
+  const normalizeAssetSelection = (selected?: number[] | null) => {
+    const picked = (selected ?? []).map(Number).filter((id) => Number.isFinite(id))
+    if (!picked.length) return undefined
+    if (!autoAssetIds.length) return picked
+    const key = (ids: number[]) => [...ids].sort((a, b) => a - b).join(',')
+    return key(picked) === key(autoAssetIds) ? undefined : picked
+  }
+
+  /** 关联资产选择框下面的实时说明：告诉用户现在这批是自动带出的还是自己改过的。 */
+  const renderAssetHint = (selected?: number[] | null) => {
+    const auto = normalizeAssetSelection(selected) === undefined
+    return (
+      <div style={{ fontSize: 12, color: '#8a93a8', lineHeight: '20px' }}>
+        {auto
+          ? '上面这批是按本镜出场角色 / 道具自动带出的，可直接删掉或添加（全部删掉 = 回到自动）。不改就等于让系统自动挑参考图：同一场戏优先接上一帧锁脸，多人镜头才各送一张单人定妆照，最多送 4 张。'
+          : '已改成手动勾选的这批：系统不再自动挑图，但群像定妆照仍会被摘掉（一张图里好几个人会被照数复制），摘了谁显示在该帧的参考提示里。'}
+      </div>
+    )
+  }
 
   /** 人工确认：确认该镜头的提示词，之后才能进入批量生图。 */
   const confirmPrompt = async () => {
@@ -606,6 +772,8 @@ export default function ShotDetailPage() {
       style: undefined,
       batch: false,
       append: target ? false : append,
+      // 上次显式勾选过的资产留在这里；没有则按本镜出场角色 / 道具自动带出，用户只做增删
+      asset_ids: shot?.last_image_asset_ids?.length ? shot.last_image_asset_ids : autoAssetIds,
       // 每张关键帧预填各自的构图提示，让三张默认就不一样，且都能单独改
       batchPrompts: target
         ? undefined
@@ -647,7 +815,7 @@ export default function ShotDetailPage() {
           n: 3,
           keyframe_id: null,
           keyframe_prompts: keyframePrompts,
-          asset_ids: values.asset_ids?.length ? values.asset_ids : undefined,
+          asset_ids: normalizeAssetSelection(values.asset_ids),
           negative_prompt: values.negative_prompt?.trim() ? values.negative_prompt : undefined,
         })
         watch(task.id)
@@ -660,7 +828,7 @@ export default function ShotDetailPage() {
           keyframe_id: targetId,
           keyframe_label: values.label || undefined,
           append: targetId ? false : Boolean(values.append),
-          asset_ids: values.asset_ids?.length ? values.asset_ids : undefined,
+          asset_ids: normalizeAssetSelection(values.asset_ids),
           negative_prompt: values.negative_prompt?.trim() ? values.negative_prompt : undefined,
         })
         watch(task.id)
@@ -714,6 +882,21 @@ export default function ShotDetailPage() {
     }
   }
 
+  /** 修复 agent：初审失败项 → 改提示词 → 重绘候选 → 复审；候选帧不替换旧帧、不自动认可。 */
+  const repairFrame = async (keyframe: ShotKeyframe) => {
+    if (!shot) return
+    setRepairBusyId(keyframe.id)
+    try {
+      const task = await shotApi.repairKeyframe(shot.id, keyframe.id)
+      watch(task.id)
+      message.success('修复 agent 已启动：读审查 → 改提示词 → 重绘 → 复审')
+    } catch (error) {
+      message.error(describeError(error))
+    } finally {
+      setRepairBusyId(null)
+    }
+  }
+
   /** 切点审查：只比对上一镜尾帧与本镜首帧，出报告；是否重跑镜头由你决定。 */
   const reviewContinuity = async () => {
     if (!shot) return
@@ -729,11 +912,37 @@ export default function ShotDetailPage() {
     }
   }
 
+  /** 切点修复 agent：写视频提示词修正；默认不重拍，勾选后才允许替换本镜视频。 */
+  const openCutRepair = () => {
+    setCutRepairResult(null)
+    setCutRepairAllow(false)
+    setCutRepairOpen(true)
+  }
+
+  const submitCutRepair = async () => {
+    if (!shot) return
+    setCutRepairBusy(true)
+    try {
+      const task = await shotApi.repairContinuity(shot.id, { allow_rerender: cutRepairAllow })
+      watch(task.id)
+      setCutRepairOpen(false)
+      message.success(
+        cutRepairAllow
+          ? '切点修复 agent 已启动：可重拍一次并复审'
+          : '切点修复 agent 已启动：只给修正建议，不重拍',
+      )
+    } catch (error) {
+      message.error(describeError(error))
+    } finally {
+      setCutRepairBusy(false)
+    }
+  }
+
   const removeKeyframe = async (keyframe: ShotKeyframe) => {
     if (!shot) return
     try {
       await shotApi.removeKeyframe(shot.id, keyframe.id)
-      message.success('已移除该关键帧（图片仍保留在素材库）')
+      message.success('已删除该关键帧，图片未被别处引用时一并从素材库移除')
       await load()
     } catch (error) {
       message.error(describeError(error))
@@ -750,6 +959,8 @@ export default function ShotDetailPage() {
       // AI 拆解时按本镜重要程度选好的分辨率，留在这里当默认值
       resolution: shot.resolution ?? undefined,
       image_media_id: primaryKeyframe?.media_id ?? undefined,
+      // 上次显式勾选过的资产保留；没有则按本镜出场角色 / 道具自动带出，用户只做增删
+      asset_ids: shot.last_video_asset_ids?.length ? shot.last_video_asset_ids : autoAssetIds,
     })
     setVideoOpen(true)
   }
@@ -765,7 +976,7 @@ export default function ShotDetailPage() {
         resolution: values.resolution,
         duration: values.duration ?? undefined,
         image_media_id: values.image_media_id ?? undefined,
-        asset_ids: values.asset_ids?.length ? values.asset_ids : undefined,
+        asset_ids: normalizeAssetSelection(values.asset_ids),
         negative_prompt: values.negative_prompt?.trim() ? values.negative_prompt : undefined,
       })
       watch(task.id)
@@ -933,6 +1144,16 @@ export default function ShotDetailPage() {
                             onClick={() => void reviewFrame(keyframe)}
                           />
                         </Tooltip>
+                        <Tooltip title="AI 修复 agent：按初审失败项改提示词 → 重绘候选 → 复审；不替换旧帧、不自动认可">
+                          <Button
+                            size="small"
+                            type="text"
+                            loading={repairBusyId === keyframe.id}
+                            disabled={!keyframe.media_id}
+                            icon={<ToolOutlined />}
+                            onClick={() => void repairFrame(keyframe)}
+                          />
+                        </Tooltip>
                         <Tooltip
                           title={
                             keyframe.approved_at
@@ -984,9 +1205,9 @@ export default function ShotDetailPage() {
                           />
                         </Tooltip>
                         <Popconfirm
-                          title="移除该关键帧？"
-                          description="仅解除与该分镜的关联，图片仍保留在素材库。"
-                          okText="移除"
+                          title="删除该关键帧？"
+                          description="会连同这张图片一起从素材库删除；只有这张图还被别的镜头或资产引用时才保留图片、仅解除本镜头关联。"
+                          okText="删除"
                           cancelText="取消"
                           okButtonProps={{ danger: true }}
                           onConfirm={() => removeKeyframe(keyframe)}
@@ -1154,6 +1375,14 @@ export default function ShotDetailPage() {
               {primaryKeyframe?.label ? `「${primaryKeyframe.label}」` : ''}
               作为首帧，也可在生成弹窗中改选。
             </Typography.Text>
+            {shot.video_note && (
+              <Alert
+                style={{ marginTop: 8 }}
+                type="warning"
+                showIcon
+                message={shot.video_note}
+              />
+            )}
             {shot.video_url && (
               <div style={{ marginTop: 10 }}>
                 <Space size={6} wrap>
@@ -1224,6 +1453,11 @@ export default function ShotDetailPage() {
                   >
                     {continuity ? '重跑切点审查' : '审查衔接'}
                   </Button>
+                  {shot.prev_shot && continuity && continuity.verdict !== 'pass' && (
+                    <Button size="small" icon={<ToolOutlined />} onClick={openCutRepair}>
+                      AI 修复切点
+                    </Button>
+                  )}
                 </Space>
                 <Typography.Text
                   type="secondary"
@@ -1913,6 +2147,7 @@ export default function ShotDetailPage() {
                 </Tooltip>
               </Space>
             }
+            extra={renderAssetHint(kfAssetSelection)}
           >
             <Select
               mode="multiple"
@@ -2111,6 +2346,7 @@ export default function ShotDetailPage() {
                 </Tooltip>
               </Space>
             }
+            extra={renderAssetHint(videoAssetSelection)}
           >
             <Select
               mode="multiple"
@@ -2151,6 +2387,149 @@ export default function ShotDetailPage() {
             </Typography.Text>
           ) : null}
         </Form>
+      </Modal>
+
+      {/* 修复 agent 轨迹：thought / action / args / observation 全量留痕 */}
+      <Modal
+        title="AI 修复 agent 运行轨迹"
+        open={repairOpen}
+        onCancel={() => setRepairOpen(false)}
+        footer={<Button onClick={() => setRepairOpen(false)}>关闭</Button>}
+        width={760}
+        destroyOnClose
+      >
+        {repairResult ? (
+          <Space direction="vertical" size={12} style={{ width: '100%' }}>
+            <Space size={6} wrap>
+              <Tag color={(REPAIR_STATUS[repairResult.status] ?? { color: 'default' }).color}>
+                {(REPAIR_STATUS[repairResult.status] ?? { text: repairResult.status }).text}
+              </Tag>
+              <Tag>步骤 {repairResult.steps ?? 0}</Tag>
+              <Tag>重绘 {repairResult.redraws ?? 0} 次</Tag>
+              {repairResult.stop_reason && <Tag>{repairResult.stop_reason}</Tag>}
+              {repairResult.candidate_keyframe_id && (
+                <Tag color="blue">候选帧 #{repairResult.candidate_keyframe_id}</Tag>
+              )}
+            </Space>
+            {repairResult.message && (
+              <Alert type="info" showIcon message={repairResult.message} />
+            )}
+            {repairResult.prompt_patch && (
+              <Alert type="warning" showIcon message={`最后一轮修正：${repairResult.prompt_patch}`} />
+            )}
+            {repairResult.review && (
+              <Typography.Text type="secondary" style={{ fontSize: 12.5 }}>
+                候选帧复审：
+                {REVIEW_VERDICT[repairResult.review.verdict]?.text ?? repairResult.review.verdict}
+                {repairResult.review.reasons?.length
+                  ? ` · ${repairResult.review.reasons.join('；')}`
+                  : ''}
+              </Typography.Text>
+            )}
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              候选帧只是追加在关键帧列表里，旧帧没有被替换；批量生视频仍然只使用你点过「认可」的帧。
+            </Typography.Text>
+            <TraceList
+              steps={repairResult.trace}
+              emptyText="没有工具调用（可能初审已通过或缺少视觉凭证）"
+            />
+          </Space>
+        ) : null}
+      </Modal>
+
+      {/* 切点修复 agent：默认只出视频提示词修正；勾选后才允许重拍并替换本镜视频 */}
+      <Modal
+        title="AI 修复切点（本镜与上一镜的衔接）"
+        open={cutRepairOpen}
+        onCancel={() => setCutRepairOpen(false)}
+        width={760}
+        destroyOnClose
+        footer={
+          cutRepairResult ? (
+            <Button onClick={() => setCutRepairOpen(false)}>关闭</Button>
+          ) : (
+            <Space>
+              <Button onClick={() => setCutRepairOpen(false)}>取消</Button>
+              <Button type="primary" loading={cutRepairBusy} onClick={() => void submitCutRepair()}>
+                启动 agent
+              </Button>
+            </Space>
+          )
+        }
+      >
+        {cutRepairResult ? (
+          <Space direction="vertical" size={12} style={{ width: '100%' }}>
+            <Space size={6} wrap>
+              <Tag color={(CUT_REPAIR_STATUS[cutRepairResult.status] ?? { color: 'default' }).color}>
+                {(CUT_REPAIR_STATUS[cutRepairResult.status] ?? { text: cutRepairResult.status }).text}
+              </Tag>
+              <Tag>步骤 {cutRepairResult.steps ?? 0}</Tag>
+              {cutRepairResult.rerendered ? <Tag color="orange">已重拍本镜</Tag> : <Tag>未重拍</Tag>}
+              {cutRepairResult.stop_reason && <Tag>{cutRepairResult.stop_reason}</Tag>}
+            </Space>
+            {cutRepairResult.message && (
+              <Alert type="info" showIcon message={cutRepairResult.message} />
+            )}
+            {cutRepairResult.summary && !cutRepairResult.message && (
+              <Alert type="info" showIcon message={cutRepairResult.summary} />
+            )}
+            {cutRepairResult.patch && (
+              <Alert
+                type="warning"
+                showIcon
+                message="视频提示词修正"
+                description={cutRepairResult.patch}
+              />
+            )}
+            {cutRepairResult.before && (
+              <Typography.Text style={{ fontSize: 12.5 }}>
+                修复前：
+                {(REVIEW_VERDICT[cutRepairResult.before.verdict] ?? { text: cutRepairResult.before.verdict }).text}
+                {cutRepairResult.before.reasons?.length
+                  ? ` · ${cutRepairResult.before.reasons.join('；')}`
+                  : ''}
+              </Typography.Text>
+            )}
+            {cutRepairResult.after && (
+              <Typography.Text style={{ fontSize: 12.5 }}>
+                复审：
+                {(REVIEW_VERDICT[cutRepairResult.after.verdict] ?? { text: cutRepairResult.after.verdict }).text}
+                {cutRepairResult.after.reasons?.length
+                  ? ` · ${cutRepairResult.after.reasons.join('；')}`
+                  : ''}
+              </Typography.Text>
+            )}
+            {cutRepairResult.notes?.length ? (
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                {cutRepairResult.notes.join('；')}
+              </Typography.Text>
+            ) : null}
+            {cutRepairResult.rerendered && (
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                本镜视频已被重拍替换；旧视频若无人引用会清理。复审只给建议，是否保留由你决定。
+              </Typography.Text>
+            )}
+            <TraceList
+              steps={cutRepairResult.trace}
+              emptyText="没有工具调用（可能审查已通过或缺少视觉凭证）"
+            />
+          </Space>
+        ) : (
+          <Space direction="vertical" size={12} style={{ width: '100%' }}>
+            <Alert
+              type="info"
+              showIcon
+              message="agent 会先读已有的切点审查，再写一条视频提示词修正；默认不改任何东西。"
+              description="只有勾选下面的「允许重拍」，它才会用自己的预算重拍本镜一次并重新比对人 / 服装 / 场景 / 光线；重拍会替换现有视频。"
+            />
+            <Checkbox checked={cutRepairAllow} onChange={(event) => setCutRepairAllow(event.target.checked)}>
+              允许重拍本镜（会替换现有视频并产生费用）
+            </Checkbox>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              不勾选时只返回提示词修正，你可以自己复制到「视频提示词」后手动重跑。
+            </Typography.Text>
+          </Space>
+        )}
       </Modal>
 
       {/* 放大预览：视频可全屏播放并拖动进度 */}

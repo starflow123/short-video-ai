@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
@@ -12,6 +13,7 @@ from app.models.keyframe import ShotKeyframe
 from app.models.media import MediaAsset
 from app.models.project import Project
 from app.models.shot import Shot
+from app.models.task import GenerationTask
 from app.models.user import User
 from app.schemas.content import (
     PromptPreviewRead,
@@ -25,7 +27,7 @@ from app.schemas.content import (
     ShotRead,
     ShotUpdate,
 )
-from app.schemas.task import GenerationRequest, TaskRead
+from app.schemas.task import CutRepairRequest, GenerationRequest, RepairRequest, TaskRead
 from app.services.dispatch import create_task
 from app.services.generation import (
     build_prompt_preview,
@@ -69,6 +71,37 @@ def _neighbor_read(shot: Shot | None) -> ShotNeighborRead | None:
     )
 
 
+async def _last_used_asset_ids(db: AsyncSession, shot_id: int, kind: str) -> list[int]:
+    """本镜头最近一次**成功**生成任务里显式勾选的关联资产。
+
+    只回传「用户显式选过」的那批：留空时后端走自动绑定 + 防分身参考策略，
+    一旦填上 asset_ids 就会跳过那套策略，所以不能替用户把自动绑定的资产填进去。
+    失败任务不算：那批勾选没能出图，恢复它等于把用户推回防分身策略之外。
+    """
+    params = (
+        await db.execute(
+            select(GenerationTask.params)
+            .where(
+                GenerationTask.shot_id == shot_id,
+                GenerationTask.kind == kind,
+                GenerationTask.status == "succeeded",
+            )
+            .order_by(GenerationTask.id.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    raw = (params or {}).get("asset_ids")
+    if not isinstance(raw, list):
+        return []
+    ids: list[int] = []
+    for value in raw:
+        try:
+            ids.append(int(value))
+        except (TypeError, ValueError):
+            continue
+    return ids
+
+
 @router.get("/{shot_id}", response_model=ShotRead)
 async def get_shot(
     shot_id: int,
@@ -81,6 +114,8 @@ async def get_shot(
     prev_shot, next_shot = await load_shot_neighbors(db, shot)
     item.prev_shot = _neighbor_read(prev_shot)
     item.next_shot = _neighbor_read(next_shot)
+    item.last_image_asset_ids = await _last_used_asset_ids(db, shot.id, "image")
+    item.last_video_asset_ids = await _last_used_asset_ids(db, shot.id, "video")
     return item
 
 
@@ -296,6 +331,51 @@ async def review_keyframe_route(
     return await serialize_keyframe(db, keyframe)
 
 
+@router.post(
+    "/{shot_id}/keyframes/{keyframe_id}/repair",
+    response_model=TaskRead,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def repair_keyframe_route(
+    shot_id: int,
+    keyframe_id: int,
+    payload: RepairRequest | None = None,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> TaskRead:
+    """启动关键帧修复 agent：初审失败项 → 改提示词 → 重绘候选 → 复审。
+
+    候选帧追加在关键帧列表里，不替换旧帧、也不会被自动认可；
+    修完后仍要用户对比、自己点「认可」才会进入批量生视频。
+    """
+    shot = await _get_owned_shot(db, user.id, shot_id)
+    keyframe = await _get_owned_keyframe(db, shot, keyframe_id)
+    if not keyframe.media_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="这一帧还没有图片，无法修复"
+        )
+    body = payload or RepairRequest()
+    task = await create_task(
+        db,
+        user_id=user.id,
+        kind="repair",
+        provider=body.provider,
+        model=body.model,
+        project_id=await _project_id_of_shot(db, shot),
+        episode_id=shot.episode_id,
+        shot_id=shot.id,
+        params={
+            "shot_id": shot.id,
+            "keyframe_id": keyframe.id,
+            "credential_id": body.credential_id,
+            "provider": body.provider,
+            "model": body.model,
+            "max_rounds": body.max_rounds,
+        },
+    )
+    return TaskRead.model_validate(task)
+
+
 @router.post("/{shot_id}/continuity")
 async def review_shot_continuity(
     shot_id: int,
@@ -327,6 +407,49 @@ async def review_shot_continuity(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     await db.commit()
     return report or {}
+
+
+@router.post(
+    "/{shot_id}/continuity/repair", response_model=TaskRead, status_code=status.HTTP_202_ACCEPTED
+)
+async def repair_shot_continuity(
+    shot_id: int,
+    payload: CutRepairRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> TaskRead:
+    """切点修复 agent：读审查结论 → 写视频提示词修正；显式开启时可重拍一次。"""
+    from app.services.agents.continuity import previous_shot
+
+    shot = await _get_owned_shot(db, user.id, shot_id)
+    if await previous_shot(db, shot) is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="这是第一个镜头，没有可修复的切点"
+        )
+    task = await create_task(
+        db,
+        user_id=user.id,
+        kind="cut_repair",
+        project_id=await _project_id_of_shot(db, shot),
+        episode_id=shot.episode_id,
+        shot_id=shot.id,
+        params={
+            "shot_id": shot.id,
+            "allow_rerender": payload.allow_rerender,
+            "credential_id": payload.credential_id,
+            "provider": payload.provider,
+            "model": payload.model,
+            "video_credential_id": payload.video_credential_id,
+            "video_provider": payload.video_provider,
+            "video_model": payload.video_model,
+        },
+    )
+    return TaskRead.model_validate(task)
+
+
+async def _project_id_of_shot(db: AsyncSession, shot: Shot) -> int | None:
+    episode = await db.get(Episode, shot.episode_id)
+    return episode.project_id if episode else None
 
 
 @router.delete(

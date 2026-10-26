@@ -7,10 +7,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
 from app.db.session import get_db
+from app.models.agent_run import AgentRun
 from app.models.task import GenerationTask
 from app.models.user import User
 from app.schemas.task import (
     CancelActiveRead,
+    DiagnoseRequest,
+    DiagnosisRead,
     TaskBatchDeleteIn,
     TaskBatchDeleteRead,
     TaskRead,
@@ -258,3 +261,73 @@ async def retry_task(
         params=dict(task.params or {}),
     )
     return TaskRead.model_validate(new_task)
+
+
+@router.post("/{task_id}/diagnose", response_model=TaskRead, status_code=status.HTTP_202_ACCEPTED)
+async def diagnose_task(
+    task_id: int,
+    payload: DiagnoseRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> TaskRead:
+    """给失败任务挂一条诊断 agent；原任务状态与分镜状态都不变。"""
+    task = await _get_owned_task(db, user.id, task_id)
+    if task.status != "failed":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="只有失败的任务才需要诊断"
+        )
+    new_task = await create_task(
+        db,
+        user_id=user.id,
+        kind="diagnose",
+        project_id=task.project_id,
+        episode_id=task.episode_id,
+        shot_id=task.shot_id,
+        params={
+            "failed_task_id": task.id,
+            "allow_retry": payload.allow_retry,
+            "credential_id": payload.credential_id,
+            "provider": payload.provider,
+            "model": payload.model,
+            "retry_credential_id": payload.retry_credential_id,
+            "retry_provider": payload.retry_provider,
+            "retry_model": payload.retry_model,
+        },
+    )
+    return TaskRead.model_validate(new_task)
+
+
+@router.get("/{task_id}/diagnosis", response_model=DiagnosisRead)
+async def get_diagnosis(
+    task_id: int,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> DiagnosisRead:
+    """读取失败任务最近一次诊断结论（只读，不触发新调用）。"""
+    await _get_owned_task(db, user.id, task_id)
+    run = (
+        await db.execute(
+            select(AgentRun)
+            .where(
+                AgentRun.user_id == user.id,
+                AgentRun.kind == "diagnose",
+                AgentRun.target_type == "task",
+                AgentRun.target_id == task_id,
+            )
+            .order_by(AgentRun.id.desc())
+            .limit(1)
+        )
+    ).scalars().first()
+    if run is None:
+        return DiagnosisRead(task_id=task_id, found=False)
+    return DiagnosisRead(
+        task_id=task_id,
+        found=True,
+        status=run.status,
+        model=run.model,
+        steps=run.steps,
+        summary=run.summary,
+        trace=run.trace or [],
+        error=run.error,
+        created_at=run.created_at,
+    )

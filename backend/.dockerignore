@@ -6,5 +6,6 @@ __pycache__/
 .pytest_cache/
 .venv/
 venv/
-tests/
+tests/*
+!tests/fixtures/
 *.sqlite3

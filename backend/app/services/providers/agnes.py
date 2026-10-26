@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import logging
 import re
 from collections.abc import Sequence
 from typing import Any
@@ -26,14 +25,24 @@ from app.services.providers.base import (
     ProviderSpec,
 )
 
-logger = logging.getLogger(__name__)
-
 _VIDEO_DONE = ("completed", "complete", "succeeded", "success")
 _VIDEO_FAILED = ("failed", "error", "canceled", "cancelled")
 
 _IMAGE_SIZE_TIERS = ("1K", "2K", "3K", "4K")
 _IMAGE_RATIOS = ("1:1", "3:4", "4:3", "16:9", "9:16", "2:3", "3:2", "21:9")
 _PIXEL_SIZE_RE = re.compile(r"^(\d+)\s*[xX×]\s*(\d+)$")
+
+# Agnes 视频接口只认这一档，且必须是大写：实测 size=1080p 返回 400 invalid_request
+# （valid_sizes=["720P"]），size=720p 小写返回 402 plan_upgrade_required，大写 720P 才建单成功。
+_VIDEO_SIZES = ("720P",)
+
+
+def _video_size(value: str | None) -> str:
+    """把 720p / 1080P / 1920x1080 这类写法收敛成 Agnes 认的档位枚举。"""
+    normalized = str(value or "").strip().upper()
+    if normalized in _VIDEO_SIZES:
+        return normalized
+    return _VIDEO_SIZES[0]
 
 
 def _image_size(value: str | None) -> str:
@@ -69,6 +78,11 @@ def _friendly_http_error(action: str, status_code: int, body: str) -> str:
         return f"{action}失败：队列已满（503 video_queue_full），请稍后重试。{body[:200]}"
     if status_code in (401, 403):
         return f"{action}失败：密钥无效或无权限（HTTP {status_code}），请到「密钥管理」检查 Key 与 Base URL。{body[:200]}"
+    if status_code == 402:
+        return (
+            f"{action}失败：当前 Agnes 账户的套餐不支持这一档（402 plan_upgrade_required），"
+            f"需要在 Agnes 后台升级套餐，或在「密钥管理」换一把有该档权限的 Key。{body[:200]}"
+        )
     return f"{action}失败（HTTP {status_code}）：{body[:300]}"
 
 
@@ -135,20 +149,15 @@ class AgnesProvider(OpenAICompatMixin, BaseProvider):
             body["image"] = references
 
         # 带参考图的请求走「图生图队列」，免费档高峰期会整段返回 503「队列已满」，
-        # 但两个图片模型的队列是独立的：一个满、另一个常常还活着（实测 2.5 第 2 次成功、
-        # 2.1 第 1 次成功）。所以重试时在两个模型之间轮换，比死磕同一个模型有效得多。
-        # 参考图直接决定人物一致性，预算给到 10 次；仍全部失败才摘掉参考图降级为纯文生图。
-        attempts = 10 if references else 1
+        # 只能排队重试。不换成另一个模型：两个模型的笔触与上色习惯不同，
+        # 同一批关键帧混用会直接看出画风漂移（实测 2.5 与 2.1 混出的帧并排不协调）。
+        # 也不摘掉参考图降级成纯文生图：那样这一帧没有长相锚点，必然画成另一个人，
+        # 还会被继续拿去做视频，代价比失败一张图大得多。排队到点就显式报错让人重跑。
+        attempts = 14 if references else 1
         reference_used = bool(references)
-        models = [model_id] + [
-            item for item in self.spec.models.get("image", []) if item != model_id
-        ]
         used_model = model_id
         resp = None
         for attempt in range(attempts):
-            if reference_used and len(models) > 1:
-                used_model = models[attempt % len(models)]
-                body["model"] = used_model
             async with self._client() as client:
                 resp = await client.post(f"{self.base_url}/images/generations", json=body)
             if resp.status_code < 400:
@@ -159,20 +168,15 @@ class AgnesProvider(OpenAICompatMixin, BaseProvider):
                     status_code=resp.status_code,
                 )
             if attempt < attempts - 1:
-                await asyncio.sleep(min(20, 4 * (attempt + 1)))
+                await asyncio.sleep(min(30, 4 * (attempt + 1)))
                 continue
-            logger.warning(
-                "Agnes 图生图队列连续 %s 次不可用（最后状态码 %s），本张降级为纯文生图，"
-                "人物一致性会下降",
-                attempts,
-                resp.status_code,
+            raise ProviderError(
+                f"图片生成失败：Agnes 图生图队列已满（{resp.status_code}），"
+                f"已在 {model_id} 上排队重试 {attempts} 次仍未进队。"
+                "等 1-2 分钟后重跑这一张即可；系统不会换模型或摘参考图降级出图，"
+                "那样画风会漂、人物一定不像本人。",
+                status_code=resp.status_code,
             )
-            body.pop("image", None)
-            body["model"] = model_id
-            used_model = model_id
-            reference_used = False
-            async with self._client() as client:
-                resp = await client.post(f"{self.base_url}/images/generations", json=body)
 
         if resp.status_code >= 400:
             raise ProviderError(
@@ -231,7 +235,7 @@ class AgnesProvider(OpenAICompatMixin, BaseProvider):
             "prompt": prompt,
             "seconds": seconds,
             "mode": mode,
-            "size": resolution or "720P",
+            "size": _video_size(resolution),
             "aspect_ratio": aspect_ratio,
         }
         if image_url:
@@ -294,8 +298,12 @@ class AgnesProvider(OpenAICompatMixin, BaseProvider):
 
         if not final.get("url"):
             raise ProviderError(f"视频完成但缺少播放地址：{final}")
-        return MediaResult(
-            url=final["url"],
-            mime_type="video/mp4",
-            meta={"model": model_id, "duration": int(seconds), "mode": mode},
-        )
+        used_size = _video_size(resolution)
+        meta: dict[str, Any] = {"model": model_id, "duration": int(seconds), "mode": mode}
+        if resolution and str(resolution).strip().upper() != used_size:
+            # 降档必须让用户看得见：分镜里 AI 选的 1080p 到 Agnes 只会出 720P，不能静默当交付了高清
+            meta["resolution_note"] = (
+                f"Agnes 视频只有 {used_size} 一档，请求的 {resolution} 已按 {used_size} 出片。"
+            )
+        meta["resolution"] = used_size
+        return MediaResult(url=final["url"], mime_type="video/mp4", meta=meta)

@@ -22,6 +22,7 @@ async def list_media(
     project_id: int | None = Query(default=None),
     shot_id: int | None = Query(default=None),
     kind: str | None = Query(default=None),
+    unlinked: bool = Query(default=False),
     limit: int = Query(default=200, ge=1, le=1000),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -29,6 +30,9 @@ async def list_media(
     stmt = select(MediaAsset).where(MediaAsset.user_id == user.id)
     if project_id is not None:
         stmt = stmt.where(MediaAsset.project_id == project_id)
+    if unlinked:
+        # 智能剪辑等「不属于某个项目」的产物：不归到任何项目卡片下，也要能被找到
+        stmt = stmt.where(MediaAsset.project_id.is_(None))
     if shot_id is not None:
         stmt = stmt.where(MediaAsset.shot_id == shot_id)
     if kind:

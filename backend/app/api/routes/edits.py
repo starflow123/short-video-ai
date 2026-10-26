@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_current_user
 from app.db.session import get_db
 from app.models.media import MediaAsset
+from app.models.project import Project
 from app.models.user import User
 from app.schemas.edit import EditCreateIn
 from app.schemas.media import MediaRead
@@ -87,10 +88,16 @@ async def create_edit(
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="素材文件缺失")
         clips.append({"media_id": media.id, "note": (item.note or "").strip() or None})
 
+    if payload.project_id is not None:
+        project = await db.get(Project, payload.project_id)
+        if not project or project.user_id != user.id:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="项目不存在")
+
     task = await create_task(
         db,
         user_id=user.id,
         kind="edit",
+        project_id=payload.project_id,
         params={
             "clips": clips,
             "target_duration": payload.target_duration,

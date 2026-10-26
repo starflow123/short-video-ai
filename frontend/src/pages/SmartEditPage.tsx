@@ -22,14 +22,16 @@ import {
   DeleteOutlined,
   DownloadOutlined,
   FileOutlined,
+  FolderOpenOutlined,
   InboxOutlined,
   ScissorOutlined,
 } from '@ant-design/icons'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 
 import { describeError } from '@/api/client'
-import { editApi, taskApi } from '@/api/endpoints'
-import type { EditResult, GenerationTask, MediaAsset } from '@/api/types'
+import { editApi, projectApi, taskApi } from '@/api/endpoints'
+import type { EditResult, GenerationTask, MediaAsset, Project } from '@/api/types'
 
 interface Clip {
   mediaId: number
@@ -57,7 +59,11 @@ function formatSize(bytes?: number | null): string {
 
 export default function SmartEditPage() {
   const { message } = App.useApp()
+  const navigate = useNavigate()
   const [clips, setClips] = useState<Clip[]>([])
+  const [projects, setProjects] = useState<Project[]>([])
+  const [projectId, setProjectId] = useState<number | null>(null)
+  const [history, setHistory] = useState<GenerationTask[]>([])
   const [uploading, setUploading] = useState(0)
   const [uploadPercent, setUploadPercent] = useState(0)
   const [target, setTarget] = useState(30)
@@ -68,6 +74,25 @@ export default function SmartEditPage() {
   const [task, setTask] = useState<GenerationTask | null>(null)
   const [result, setResult] = useState<EditResult | null>(null)
   const timer = useRef<number | null>(null)
+
+  const loadHistory = useCallback(async () => {
+    try {
+      setHistory(await taskApi.list({ kind: 'edit', limit: 8 }))
+    } catch {
+      // 历史加载失败不影响当前剪辑，任务中心仍可查看
+    }
+  }, [])
+
+  useEffect(() => {
+    void (async () => {
+      try {
+        setProjects(await projectApi.list())
+      } catch {
+        // 没有项目时仍可剪辑，成片进「未归属素材」
+      }
+      void loadHistory()
+    })()
+  }, [loadHistory])
 
   const totalDuration = useMemo(
     () => clips.reduce((sum, clip) => sum + (clip.duration || 0), 0),
@@ -127,7 +152,8 @@ export default function SmartEditPage() {
         setTask(next)
         if (next.status === 'succeeded') {
           setResult((next.result || null) as EditResult | null)
-          message.success('成片已生成')
+          message.success('成片已生成，可在下方「最近剪辑」或素材库查看')
+          void loadHistory()
           return
         }
         if (next.status === 'failed' || next.status === 'canceled') {
@@ -141,7 +167,7 @@ export default function SmartEditPage() {
       }
       timer.current = window.setTimeout(() => void poll(id), 2500)
     },
-    [message],
+    [message, loadHistory],
   )
 
   const start = async () => {
@@ -162,6 +188,7 @@ export default function SmartEditPage() {
         aspect_ratio: aspect,
         pace,
         instruction: instruction.trim() || null,
+        project_id: projectId,
       })
       setTask(created)
       message.success('剪辑任务已提交，正在分析素材')
@@ -175,6 +202,8 @@ export default function SmartEditPage() {
 
   const running = task ? ACTIVE.has(task.status) : false
   const progress = result ? 100 : task?.progress ?? 0
+  const resultProject =
+    result?.project_id != null ? projects.find((project) => project.id === result.project_id) : undefined
 
   return (
     <div>
@@ -318,6 +347,22 @@ export default function SmartEditPage() {
                   </Form.Item>
                 </Col>
               </Row>
+              <Form.Item
+                label="成片归属项目（可选）"
+                extra="不选则进「素材库 → 未归属项目的素材」，同样能找回与下载"
+              >
+                <Select
+                  allowClear
+                  placeholder="不归属任何项目"
+                  value={projectId ?? undefined}
+                  disabled={running}
+                  onChange={(value) => setProjectId(value ?? null)}
+                  options={projects.map((project) => ({
+                    value: project.id,
+                    label: project.title,
+                  }))}
+                />
+              </Form.Item>
               <Form.Item label="剪辑要求（可选）">
                 <Input.TextArea
                   rows={4}
@@ -336,7 +381,7 @@ export default function SmartEditPage() {
               showIcon
               style={{ marginBottom: 12 }}
               message="只剪画面，不加字幕与配音"
-              description="系统按场景切分和你的备注选段；无音轨素材会自动补静音。成片存入素材库。"
+              description="系统按场景切分和你的备注选段；无音轨素材会自动补静音。成片存入素材库，归属所选项目；没选项目则在「未归属项目的素材」里。"
             />
 
             <Button
@@ -380,6 +425,15 @@ export default function SmartEditPage() {
                   <Tag color="success">{formatDuration(result.duration_seconds)}</Tag>
                   <Button
                     size="small"
+                    icon={<FolderOpenOutlined />}
+                    onClick={() =>
+                      navigate(result.project_id != null ? `/media/${result.project_id}` : '/media/unlinked')
+                    }
+                  >
+                    素材库
+                  </Button>
+                  <Button
+                    size="small"
                     icon={<DownloadOutlined />}
                     href={result.url}
                     target="_blank"
@@ -401,10 +455,62 @@ export default function SmartEditPage() {
                 </Typography.Text>
               )}
               <Typography.Text type="secondary" style={{ fontSize: 12.5 }}>
-                共 {result.segments} 个片段 · {result.aspect_ratio} · 已存入素材库
+                共 {result.segments} 个片段 · {result.aspect_ratio} ·{' '}
+                {resultProject
+                  ? `已存入「${resultProject.title}」的素材库`
+                  : '已存入素材库 → 未归属项目的素材'}
               </Typography.Text>
             </Card>
           )}
+
+          <Card
+            title="最近剪辑"
+            style={{ marginTop: 16 }}
+            extra={
+              <Button size="small" onClick={() => void loadHistory()}>
+                刷新
+              </Button>
+            }
+          >
+            {history.length === 0 ? (
+              <Empty description="还没有剪辑记录" image={Empty.PRESENTED_IMAGE_SIMPLE} />
+            ) : (
+              <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                {history.map((item) => {
+                  const res = (item.result || null) as EditResult | null
+                  const active = ACTIVE.has(item.status)
+                  return (
+                    <Card key={item.id} size="small" styles={{ body: { padding: 10 } }}>
+                      <Space size={8} wrap>
+                        <Tag color={active ? 'processing' : item.status === 'succeeded' ? 'success' : 'error'}>
+                          #{item.id}
+                        </Tag>
+                        <Typography.Text style={{ fontSize: 12.5 }}>
+                          {res?.title || (item.params?.instruction as string) || '智能剪辑'}
+                        </Typography.Text>
+                        {res ? <Tag>{formatDuration(res.duration_seconds)}</Tag> : null}
+                        {active ? <Tag color="processing">{item.progress}%</Tag> : null}
+                        {res?.url ? (
+                          <Button size="small" type="link" href={res.url} target="_blank">
+                            打开成片
+                          </Button>
+                        ) : null}
+                      </Space>
+                      <Typography.Text type="secondary" style={{ fontSize: 11.5, display: 'block', marginTop: 4 }}>
+                        {new Date(item.created_at).toLocaleString()} ·{' '}
+                        {item.project_id != null ? '归属项目' : '未归属项目'} ·{' '}
+                        {item.status === 'succeeded'
+                          ? '已完成'
+                          : item.status === 'failed'
+                            ? item.error || '失败'
+                            : item.status}
+                      </Typography.Text>
+                    </Card>
+                  )
+                })}
+              </Space>
+            )}
+          </Card>
         </Col>
       </Row>
     </div>

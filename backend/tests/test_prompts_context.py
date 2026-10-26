@@ -105,7 +105,7 @@ def test_compose_image_prompt_orders_context_blocks():
         prompt.index("雨夜巷口，中景"),
         prompt.index("【风格收束】"),
         prompt.index("【本镜头主体与道具归属"),
-        prompt.index("【参考图对应关系"),
+        prompt.index("【参考图"),
         # 场景锚点先于镜头语言与动作：先交代「在哪、什么光」，再说「怎么拍、做什么」
         prompt.index("【镜头起始状态】"),
         prompt.index("【镜头语言"),
@@ -114,8 +114,8 @@ def test_compose_image_prompt_orders_context_blocks():
         prompt.index("【负面提示"),
     ]
     assert order == sorted(order)
-    assert "图1：角色「杨间」" in prompt
-    assert "图2：道具「黑色鬼伞」" in prompt
+    assert "图1=角色「杨间」" in prompt
+    assert "图2=道具「黑色鬼伞」" in prompt
     assert "持有者=杨间" in prompt
     assert "定格在 0-1.5s 的瞬间：抬手撑伞" in prompt
     # 图片只要第一拍定格，不应把整条时间轴塞进去
@@ -210,7 +210,7 @@ def test_prompt_budgets_keep_every_critical_block():
     for text in (image, video):
         for marker in (
             "【人数",
-            "【参考图对应关系",
+            "【参考图",
             "【负面提示",
             "【风格收束】",
         ):
@@ -233,8 +233,8 @@ def test_multi_person_rule_counts_references_not_people():
         ],
         lean=True,
     )
-    assert "参考图张数≠画面人数" in block
-    assert "不画分身" in block
+    assert "张数≠人数" in block
+    assert "同一角色只画一次" in block
 
 
 _ASSETS = [
@@ -697,3 +697,26 @@ def test_full_video_layers_survive_the_budget():
     sizes = {item["tag"]: item["chars"] for item in blocks}
     assert [tag for tag, chars in sizes.items() if chars == 0] == []
     assert 0 < sizes["base"] <= 300
+
+
+def test_shot_style_text_carries_painting_style_for_preview():
+    """编译预览与真实生成必须用同一份风格文案：只取 style 会让「手绘动画」凭空消失。"""
+    import asyncio
+
+    from app.services.generation import _style_of
+
+    episode = SimpleNamespace(id=48, project_id=49)
+    project = SimpleNamespace(
+        id=49,
+        style="日系治愈短片",
+        visual_style="日系手绘动画质感，暖橙与雾蓝低饱和配色",
+    )
+
+    class _Session:
+        async def get(self, model, pk):
+            return episode if model.__name__ == "Episode" else project
+
+    shot = SimpleNamespace(episode_id=48)
+    text = asyncio.run(_style_of(_Session(), shot))
+
+    assert "日系手绘动画质感" in text and "日系治愈短片" in text

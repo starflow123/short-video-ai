@@ -182,7 +182,12 @@ async def generate_asset_image(
     # 手动指定的参考图必须是当前用户自己的图片，否则会把别人的素材送进模型
     await _validate_media(db, user.id, payload.reference_media_id)
 
-    prompt = (payload.prompt or asset.prompt or asset.description or "").strip()
+    # 构图指令由 sheet_prompt_for 统一生成：资产页重画与拆解自动补图走同一份要求，
+    # 也顺手剥掉旧提示词里叠着的「三视图」，避免每重画一次多叠一遍
+    from app.services.generation import sheet_prompt_for
+
+    auto_prompt, auto_negative = sheet_prompt_for(asset)
+    prompt = (payload.prompt or "").strip() or auto_prompt
     if not prompt:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -198,7 +203,7 @@ async def generate_asset_image(
         "credential_id": payload.credential_id,
         "provider": payload.provider,
         "model": payload.model,
-        "negative_prompt": payload.negative_prompt,
+        "negative_prompt": payload.negative_prompt or auto_negative,
         "n": payload.n,
         "aspect_ratio": payload.aspect_ratio,
         "size": payload.size,

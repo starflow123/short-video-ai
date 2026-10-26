@@ -58,7 +58,7 @@ function MediaCard({
   asset: MediaAsset
   onExpand: () => void
   onDelete: () => void
-  onSaveAsset: () => void
+  onSaveAsset?: () => void
 }) {
   return (
     <Card
@@ -89,9 +89,13 @@ function MediaCard({
               </Tooltip>,
             ]
           : [
-              <Tooltip key="asset" title="存为资产（角色 / 场景 / 道具 / 服装），生成时可直接复用">
-                <Button type="text" icon={<TeamOutlined />} onClick={onSaveAsset} />
-              </Tooltip>,
+              ...(onSaveAsset
+                ? [
+                    <Tooltip key="asset" title="存为资产（角色 / 场景 / 道具 / 服装），生成时可直接复用">
+                      <Button type="text" icon={<TeamOutlined />} onClick={onSaveAsset} />
+                    </Tooltip>,
+                  ]
+                : []),
             ]),
         <Button
           key="download"
@@ -153,6 +157,11 @@ function MediaProjects() {
     return map
   }, [assets])
 
+  const unlinkedCount = useMemo(
+    () => assets.filter((asset) => asset.project_id == null).length,
+    [assets],
+  )
+
   return (
     <div>
       <div className="page-head">
@@ -174,6 +183,22 @@ function MediaProjects() {
           ]
         }}
       />
+      {unlinkedCount > 0 && (
+        <Card
+          className="hover-card"
+          hoverable
+          style={{ marginTop: 16 }}
+          onClick={() => navigate('/media/unlinked')}
+        >
+          <Space size={10} wrap>
+            <Typography.Text strong>未归属项目的素材</Typography.Text>
+            <Tag>{unlinkedCount} 个</Tag>
+          </Space>
+          <Typography.Paragraph type="secondary" style={{ margin: '6px 0 0', fontSize: 12.5 }}>
+            智能剪辑成片、单独上传的素材等不属于任何项目的文件都在这里，点击查看。
+          </Typography.Paragraph>
+        </Card>
+      )}
     </div>
   )
 }
@@ -420,8 +445,101 @@ function ProjectMedia({ projectId }: { projectId: number }) {
   )
 }
 
+/** 未归属项目：智能剪辑成片 / 单独上传的素材，不属于任何项目也要能被找到。 */
+function UnaffiliatedMedia() {
+  const { message } = App.useApp()
+  const navigate = useNavigate()
+  const [assets, setAssets] = useState<MediaAsset[]>([])
+  const [loading, setLoading] = useState(true)
+  const [preview, setPreview] = useState<MediaAsset | null>(null)
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    try {
+      setAssets(await mediaApi.list({ unlinked: true }))
+    } catch (error) {
+      message.error(describeError(error))
+    } finally {
+      setLoading(false)
+    }
+  }, [message])
+
+  useEffect(() => {
+    void load()
+  }, [load])
+
+  const handleDelete = async (id: number) => {
+    try {
+      await mediaApi.remove(id)
+      message.success('素材已删除')
+      setAssets((prev) => prev.filter((asset) => asset.id !== id))
+    } catch (error) {
+      message.error(describeError(error))
+    }
+  }
+
+  return (
+    <div>
+      <div className="page-head">
+        <div>
+          <Space size={10} align="center" style={{ marginBottom: 2 }}>
+            <Button icon={<ArrowLeftOutlined />} size="small" onClick={() => navigate('/media')}>
+              返回
+            </Button>
+            <h2 className="page-title" style={{ margin: 0 }}>
+              未归属项目的素材
+            </h2>
+          </Space>
+          <p className="page-sub">共 {assets.length} 个素材；智能剪辑成片与单独上传的文件都在这里。</p>
+        </div>
+        <Button icon={<ReloadOutlined />} onClick={() => void load()}>
+          刷新
+        </Button>
+      </div>
+
+      {loading ? null : assets.length === 0 ? (
+        <Card>
+          <Empty description="暂无未归属素材" />
+        </Card>
+      ) : (
+        <Row gutter={[16, 16]}>
+          {assets.map((asset) => (
+            <Col key={asset.id} xs={24} sm={12} md={8} lg={6} xxl={4}>
+              <MediaCard
+                asset={asset}
+                onExpand={() => setPreview(asset)}
+                onDelete={() => handleDelete(asset.id)}
+              />
+            </Col>
+          ))}
+        </Row>
+      )}
+
+      <Modal
+        title={preview ? `${preview.provider ?? ''} ${preview.model ?? preview.filename}`.trim() : ''}
+        open={!!preview}
+        onCancel={() => setPreview(null)}
+        footer={null}
+        centered
+        width={900}
+        destroyOnClose
+      >
+        {preview && (
+          <video
+            src={mediaUrl(preview.url)}
+            controls
+            autoPlay
+            style={{ width: '100%', maxHeight: '72vh', background: '#000', borderRadius: 8 }}
+          />
+        )}
+      </Modal>
+    </div>
+  )
+}
+
 export default function MediaPage() {
   const { projectId } = useParams<{ projectId?: string }>()
+  if (projectId === 'unlinked') return <UnaffiliatedMedia />
   const parsed = Number(projectId)
   return projectId && Number.isFinite(parsed) ? <ProjectMedia projectId={parsed} /> : <MediaProjects />
 }

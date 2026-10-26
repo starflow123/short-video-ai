@@ -1,5 +1,6 @@
 import { http } from './client'
 import type {
+  AgentRun,
   AssetGeneratePayload,
   AssetPayload,
   BreakdownPayload,
@@ -7,14 +8,21 @@ import type {
   ContinuityReview,
   Credential,
   CredentialPayload,
+  CutRepairPayload,
+  DiagnosePayload,
+  Diagnosis,
   EditCreatePayload,
   Episode,
+  EvalRunDetail,
+  EvalRunSummary,
   EpisodePayload,
   ForgePayload,
   GenerationPayload,
   GenerationTask,
   KeyframePayload,
+  KnowledgeNote,
   MediaAsset,
+  OrganizeResult,
   PipelineConfirmPayload,
   PipelineRun,
   PipelineStartPayload,
@@ -28,6 +36,7 @@ import type {
   ProductionAsset,
   PromptPreview,
   ProviderInfo,
+  QualityStats,
   Shot,
   ShotFieldSuggestPayload,
   ShotFieldSuggestion,
@@ -132,11 +141,19 @@ export const shotApi = {
     http
       .post<ShotKeyframe>(`/shots/${id}/keyframes/${keyframeId}/review`)
       .then((r) => r.data),
+  /** 启动修复 agent：初审失败项 → 改提示词 → 重绘候选 → 复审；不会自动认可 */
+  repairKeyframe: (id: number, keyframeId: number) =>
+    http
+      .post<GenerationTask>(`/shots/${id}/keyframes/${keyframeId}/repair`)
+      .then((r) => r.data),
   removeKeyframe: (id: number, keyframeId: number) =>
     http.delete(`/shots/${id}/keyframes/${keyframeId}`).then((r) => r.data),
   /** 切点审查：重跑本镜与上一镜之间的衔接检查，只出报告、不影响导出 */
   reviewContinuity: (id: number) =>
     http.post<ContinuityReview>(`/shots/${id}/continuity`).then((r) => r.data),
+  /** 切点修复 agent：给视频提示词修正；显式开启时才重拍并替换下一镜视频 */
+  repairContinuity: (id: number, data: CutRepairPayload) =>
+    http.post<GenerationTask>(`/shots/${id}/continuity/repair`, data).then((r) => r.data),
 }
 
 // ------------------------------ 任务 ------------------------------
@@ -167,11 +184,17 @@ export const taskApi = {
     http
       .post<{ deleted: number; skipped_ids: number[] }>('/tasks/delete-all', null, { params })
       .then((r) => r.data),
+  /** 给失败任务挂一条诊断 agent（原任务状态不变） */
+  diagnose: (id: number, data: DiagnosePayload) =>
+    http.post<GenerationTask>(`/tasks/${id}/diagnose`, data).then((r) => r.data),
+  /** 读失败任务最近一次诊断结论，不触发新调用 */
+  diagnosis: (id: number) =>
+    http.get<Diagnosis>(`/tasks/${id}/diagnosis`).then((r) => r.data),
 }
 
 // ------------------------------ 媒体 ------------------------------
 export const mediaApi = {
-  list: (params?: { project_id?: number; shot_id?: number; kind?: string }) =>
+  list: (params?: { project_id?: number; shot_id?: number; kind?: string; unlinked?: boolean }) =>
     http.get<MediaAsset[]>('/media', { params }).then((r) => r.data),
   remove: (id: number) => http.delete(`/media/${id}`).then((r) => r.data),
 }
@@ -195,6 +218,31 @@ export const assetApi = {
   generate: (id: number, data: AssetGeneratePayload) =>
     http.post<GenerationTask>(`/assets/${id}/generate`, data).then((r) => r.data),
   remove: (id: number) => http.delete(`/assets/${id}`).then((r) => r.data),
+}
+
+// ------------------------------ AI 助手 / 处理记录 ------------------------------
+export const agentApi = {
+  /** 素材整理：只读扫描并给建议，不合并、不删除 */
+  organizeAssets: (
+    projectId: number | undefined,
+    data: { use_llm?: boolean; provider?: string | null; credential_id?: number | null; model?: string | null },
+  ) =>
+    http
+      .post<OrganizeResult>('/agents/organize-assets', data, {
+        params: projectId ? { project_id: projectId } : undefined,
+      })
+      .then((r) => r.data),
+}
+
+export const agentRunApi = {
+  list: (params?: {
+    project_id?: number
+    kind?: string
+    target_type?: string
+    target_id?: number
+    limit?: number
+  }) => http.get<AgentRun[]>('/agent-runs', { params }).then((r) => r.data),
+  get: (id: number) => http.get<AgentRun>(`/agent-runs/${id}`).then((r) => r.data),
 }
 
 // ------------------------------ 智能剪辑 ------------------------------
@@ -246,4 +294,28 @@ export const pipelineApi = {
   /** 批量生视频：只消费已人工认可的关键帧；全部齐了自动导出成片 */
   videos: (runId: number, data: PipelineVideoPayload) =>
     http.post<PipelineRun>(`/pipeline/runs/${runId}/videos`, data).then((r) => r.data),
+}
+
+// ------------------------------ 质量看板（只读） ------------------------------
+export const statsApi = {
+  generations: (params?: { project_id?: number; days?: number }) =>
+    http.get<QualityStats>('/stats/generations', { params }).then((r) => r.data),
+}
+
+export const evalApi = {
+  list: (params?: { project_id?: number; limit?: number }) =>
+    http.get<EvalRunSummary[]>('/eval/runs', { params }).then((r) => r.data),
+  get: (id: number) => http.get<EvalRunDetail>(`/eval/runs/${id}`).then((r) => r.data),
+}
+
+export const knowledgeApi = {
+  list: (params?: { include_unapproved?: boolean; status?: string; category?: string }) =>
+    http.get<KnowledgeNote[]>('/knowledge', { params }).then((r) => r.data),
+  /** 资格门预览：修复 agent 实际会拿到的就是这一条过滤结果 */
+  lookup: (params?: {
+    project_id?: number
+    visual_style?: string
+    category?: string
+    media_type?: string
+  }) => http.get<KnowledgeNote[]>('/knowledge/lookup', { params }).then((r) => r.data),
 }

@@ -82,6 +82,7 @@ async def serialize_shots(db: AsyncSession, shots: list[Shot]) -> list[ShotRead]
             meta = metas.get(shot.video_media_id) or {}
             review = meta.get("continuity_review")
             item.continuity_review = review if isinstance(review, dict) else None
+            item.video_note = meta.get("resolution_note")
         item.keyframes = []
         for keyframe in keyframe_map.get(shot.id, []):
             keyframe_item = ShotKeyframeRead(

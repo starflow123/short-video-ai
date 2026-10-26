@@ -1,6 +1,8 @@
 """分集：详情 / 更新 / 删除 / 分镜列表与创建 / 剧本拆解。"""
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,10 +20,12 @@ from app.schemas.content import (
     ShotCreate,
     ShotPlanRead,
     ShotPlanRequest,
+    ShotPlanReviewRead,
     ShotRead,
 )
 from app.schemas.task import BreakdownRequest, TaskRead
 from app.services import generation
+from app.services.agents import director
 from app.services.dispatch import create_task
 from app.services.references import (
     media_of_shots,
@@ -31,6 +35,8 @@ from app.services.references import (
 )
 
 router = APIRouter(prefix="/episodes", tags=["分集"])
+
+logger = logging.getLogger(__name__)
 
 
 async def _get_owned_episode(db: AsyncSession, user_id: int, episode_id: int) -> Episode:
@@ -188,7 +194,51 @@ async def breakdown_plan_episode(
         provider_key=payload.provider,
         model=payload.model,
     )
-    return ShotPlanRead(**data)
+    review: ShotPlanReviewRead | None = None
+    if payload.review:
+        plan = {
+            "reasoning": data.get("reasoning") or "",
+            "shot_count": data.get("shot_count"),
+            "shot_seconds": data.get("shot_seconds"),
+            "target_seconds": data.get("target_seconds"),
+            "beats": data.get("beats") or [],
+        }
+        try:
+            result = await director.review_plan(
+                db,
+                user_id=user.id,
+                episode=episode,
+                plan=plan,
+                script=episode.script_text or "",
+                shot_count=int(data.get("shot_count") or 0),
+                shot_seconds=int(data.get("shot_seconds") or 8),
+                target_seconds=int(data.get("target_seconds") or 0),
+                credential_id=payload.credential_id,
+                provider_key=payload.provider,
+                model=payload.model,
+            )
+            await db.commit()
+        except Exception as exc:  # noqa: BLE001 - 自检是增强项，失败不能挡住规划
+            await db.rollback()
+            logger.warning("分集 %s 导演自检跳过：%s", episode.id, exc)
+            review = ShotPlanReviewRead(status="unavailable", message=str(exc)[:200])
+        else:
+            final = result.get("plan") or plan
+            data = {
+                "reasoning": final.get("reasoning") or data.get("reasoning") or "",
+                "shot_count": final.get("shot_count") or data["shot_count"],
+                "shot_seconds": final.get("shot_seconds") or data["shot_seconds"],
+                "target_seconds": final.get("target_seconds") or data["target_seconds"],
+                "beats": final.get("beats") or data["beats"],
+            }
+            review = ShotPlanReviewRead(
+                status=str(result.get("status") or "clean"),
+                issues=result.get("issues") or [],
+                revisions=int(result.get("revisions") or 0),
+                trace=result.get("trace") or [],
+                message=result.get("message"),
+            )
+    return ShotPlanRead(**data, review=review)
 
 
 @router.post("/{episode_id}/breakdown", response_model=TaskRead, status_code=status.HTTP_202_ACCEPTED)

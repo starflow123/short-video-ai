@@ -4,10 +4,12 @@ import {
   App,
   Button,
   Card,
+  Checkbox,
   Col,
   Descriptions,
   Drawer,
   Empty,
+  Modal,
   Popconfirm,
   Progress,
   Row,
@@ -24,6 +26,7 @@ import {
   RedoOutlined,
   ReloadOutlined,
   RightOutlined,
+  RobotOutlined,
   StopOutlined,
 } from '@ant-design/icons'
 import type { ColumnsType } from 'antd/es/table'
@@ -31,9 +34,9 @@ import type { TableRowSelection } from 'antd/es/table/interface'
 import { useNavigate, useParams } from 'react-router-dom'
 
 import ProjectCards from '@/components/ProjectCards'
-import { episodeApi, projectApi, taskApi } from '@/api/endpoints'
+import { agentRunApi, episodeApi, projectApi, taskApi } from '@/api/endpoints'
 import { describeError, mediaUrl } from '@/api/client'
-import type { GenerationTask, Project } from '@/api/types'
+import type { AgentRun, Diagnosis, GenerationTask, Project } from '@/api/types'
 
 const KIND_LABEL: Record<string, string> = {
   text: '文本',
@@ -41,6 +44,55 @@ const KIND_LABEL: Record<string, string> = {
   video: '视频',
   export: '导出',
   edit: '剪辑',
+  repair: '修复',
+  diagnose: 'AI 诊断',
+  cut_repair: '切点修复',
+}
+
+const DIAGNOSIS_STATUS: Record<string, { text: string; color: string }> = {
+  diagnosed: { text: '已诊断', color: 'blue' },
+  retried: { text: '已换凭证重跑', color: 'green' },
+  needs_human: { text: '需要人工处理', color: 'orange' },
+  agent_error: { text: '诊断出错', color: 'red' },
+  review_unavailable: { text: '无法诊断', color: 'default' },
+}
+
+const CONFIDENCE_LABEL: Record<string, string> = {
+  high: '把握大',
+  medium: '把握中',
+  low: '把握小',
+}
+
+const AGENT_KIND_LABEL: Record<string, string> = {
+  director: '导演自检',
+  diagnose: '失败诊断',
+  cut_repair: '切点修复',
+  organize: '素材整理',
+  repair: '关键帧修复',
+  visual_review: '关键帧初审',
+  continuity_review: '切点审查',
+}
+
+const AGENT_STATUS_LABEL: Record<string, string> = {
+  pass: '通过',
+  warn: '需注意',
+  fail: '不合格',
+}
+
+const AGENT_STATUS_COLOR: Record<string, string> = {
+  clean: 'green',
+  revised: 'blue',
+  repaired: 'green',
+  improved: 'cyan',
+  diagnosed: 'blue',
+  retried: 'green',
+  suggested: 'blue',
+  prioritized: 'blue',
+  already_pass: 'green',
+  patch_only: 'blue',
+  pass: 'green',
+  warn: 'orange',
+  fail: 'red',
 }
 const STATUS: Record<string, { text: string; color: string }> = {
   pending: { text: '排队中', color: 'default' },
@@ -193,6 +245,19 @@ function ProjectTasks({ projectId }: { projectId: number }) {
   const [detailId, setDetailId] = useState<number | null>(null)
   const [selected, setSelected] = useState<number[]>([])
 
+  // 失败诊断 agent：读已有结论或新起一条诊断任务；默认只分析，不重跑
+  const [diagnoseTask, setDiagnoseTask] = useState<GenerationTask | null>(null)
+  const [diagnosis, setDiagnosis] = useState<Diagnosis | null>(null)
+  const [diagnosisLoading, setDiagnosisLoading] = useState(false)
+  const [diagnoseBusy, setDiagnoseBusy] = useState(false)
+  const [allowRetry, setAllowRetry] = useState(false)
+
+  // AI 处理记录：循环 agent 与单次审查器的结论、轨迹都从 agent_runs 只读汇总
+  const [agentRunsOpen, setAgentRunsOpen] = useState(false)
+  const [agentRunsLoading, setAgentRunsLoading] = useState(false)
+  const [agentRuns, setAgentRuns] = useState<AgentRun[]>([])
+  const [agentRunKind, setAgentRunKind] = useState<string | undefined>()
+
   const load = useCallback(async () => {
     try {
       const list = await taskApi.list({ project_id: projectId, kind, status })
@@ -261,6 +326,65 @@ function ProjectTasks({ projectId }: { projectId: number }) {
 
   // 详情抽屉：始终取列表里的最新快照，运行中的任务会随轮询自动刷新
   const detail = useMemo(() => tasks.find((task) => task.id === detailId) ?? null, [tasks, detailId])
+
+  const openDiagnosis = async (record: GenerationTask) => {
+    setDiagnoseTask(record)
+    setDiagnosis(null)
+    setAllowRetry(false)
+    setDiagnosisLoading(true)
+    try {
+      setDiagnosis(await taskApi.diagnosis(record.id))
+    } catch (error) {
+      message.error(describeError(error))
+    } finally {
+      setDiagnosisLoading(false)
+    }
+  }
+
+  const submitDiagnosis = async () => {
+    if (!diagnoseTask) return
+    setDiagnoseBusy(true)
+    try {
+      await taskApi.diagnose(diagnoseTask.id, { allow_retry: allowRetry })
+      message.success(
+        allowRetry
+          ? '诊断 agent 已启动：允许换一套凭证重跑一次'
+          : '诊断 agent 已启动：只分析原因，不重跑',
+      )
+      setDiagnoseTask(null)
+      await load()
+    } catch (error) {
+      message.error(describeError(error))
+    } finally {
+      setDiagnoseBusy(false)
+    }
+  }
+
+  const diagnosisReport = diagnosis?.summary?.diagnosis ?? null
+
+  const openAgentRuns = async () => {
+    setAgentRunsOpen(true)
+    setAgentRunsLoading(true)
+    try {
+      setAgentRuns(await agentRunApi.list({ project_id: projectId, kind: agentRunKind, limit: 120 }))
+    } catch (error) {
+      message.error(describeError(error))
+    } finally {
+      setAgentRunsLoading(false)
+    }
+  }
+
+  const filterAgentRuns = async (kind?: string) => {
+    setAgentRunKind(kind)
+    setAgentRunsLoading(true)
+    try {
+      setAgentRuns(await agentRunApi.list({ project_id: projectId, kind, limit: 120 }))
+    } catch (error) {
+      message.error(describeError(error))
+    } finally {
+      setAgentRunsLoading(false)
+    }
+  }
 
   const handleCancel = async (id: number) => {
     try {
@@ -413,7 +537,7 @@ function ProjectTasks({ projectId }: { projectId: number }) {
     {
       title: '操作',
       key: 'actions',
-      width: 190,
+      width: 250,
       render: (_, record) => (
         <Space size={4}>
           <Button size="small" onClick={() => setDetailId(record.id)}>
@@ -422,6 +546,11 @@ function ProjectTasks({ projectId }: { projectId: number }) {
           {ACTIVE.has(record.status) && (
             <Button size="small" icon={<StopOutlined />} onClick={() => handleCancel(record.id)}>
               取消
+            </Button>
+          )}
+          {record.status === 'failed' && !['diagnose', 'repair', 'cut_repair'].includes(record.kind) && (
+            <Button size="small" icon={<RobotOutlined />} onClick={() => void openDiagnosis(record)}>
+              诊断
             </Button>
           )}
           {!ACTIVE.has(record.status) && (
@@ -492,6 +621,9 @@ function ProjectTasks({ projectId }: { projectId: number }) {
             onChange={setStatus}
             options={Object.entries(STATUS).map(([value, meta]) => ({ value, label: meta.text }))}
           />
+          <Button icon={<RobotOutlined />} onClick={() => void openAgentRuns()}>
+            AI 处理记录
+          </Button>
           {selected.length > 0 && (
             <Popconfirm
               title={`删除选中的 ${selected.length} 条任务记录？`}
@@ -575,6 +707,207 @@ function ProjectTasks({ projectId }: { projectId: number }) {
         })
       )}
 
+      {/* AI 处理记录：5 个循环 agent + 2 个单次审查器的统一审计视图 */}
+      <Drawer
+        title="AI 处理记录（本项目）"
+        open={agentRunsOpen}
+        onClose={() => setAgentRunsOpen(false)}
+        width="min(640px, 94vw)"
+        extra={<Button onClick={() => void openAgentRuns()}>刷新</Button>}
+      >
+        <Space direction="vertical" size={10} style={{ width: '100%' }}>
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            自检、诊断、修复、整理与两类审查的结论、步骤、工具轨迹都留在这里；只读，不影响任务与素材。
+          </Typography.Text>
+          <Select
+            allowClear
+            size="small"
+            placeholder="按类型筛选"
+            style={{ width: 200 }}
+            value={agentRunKind}
+            onChange={(value) => void filterAgentRuns(value)}
+            options={Object.entries(AGENT_KIND_LABEL).map(([value, label]) => ({ value, label }))}
+          />
+          {agentRunsLoading ? (
+            <Typography.Text type="secondary">正在读取…</Typography.Text>
+          ) : agentRuns.length === 0 ? (
+            <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="本项目还没有 agent 运行记录" />
+          ) : (
+            agentRuns.map((run) => (
+              <Card key={run.id} size="small" styles={{ body: { padding: 10 } }}>
+                <Space size={6} wrap>
+                  <Tag color="blue">{AGENT_KIND_LABEL[run.kind] ?? run.kind}</Tag>
+                  <Tag color={AGENT_STATUS_COLOR[run.status ?? ''] ?? 'default'}>
+                    {AGENT_STATUS_LABEL[run.status ?? ''] ?? run.status ?? '—'}
+                  </Tag>
+                  <Tag>
+                    {run.target_type ?? '—'} {run.target_id ?? '—'}
+                  </Tag>
+                  <Tag>步骤 {run.steps}</Tag>
+                  {run.model && <Tag>{run.model}</Tag>}
+                  <Typography.Text type="secondary" style={{ fontSize: 11.5 }}>
+                    {formatTime(run.created_at)}
+                  </Typography.Text>
+                </Space>
+                {run.error && (
+                  <Typography.Paragraph type="danger" style={{ fontSize: 12, margin: '6px 0 0' }}>
+                    {run.error}
+                  </Typography.Paragraph>
+                )}
+                {run.summary && (
+                  <pre className="task-json" style={{ maxHeight: 160, marginTop: 6 }}>
+                    {JSON.stringify(run.summary, null, 2)}
+                  </pre>
+                )}
+                {run.trace.length > 0 && (
+                  <details style={{ marginTop: 6 }}>
+                    <summary style={{ fontSize: 12, cursor: 'pointer' }}>
+                      工具轨迹（{run.trace.length} 步）
+                    </summary>
+                    {run.trace.map((step, index) => (
+                      <Typography.Paragraph
+                        key={`${step.step}-${index}`}
+                        style={{ fontSize: 12, margin: '4px 0 0' }}
+                      >
+                        <Tag color={step.ok ? 'blue' : 'red'}>{step.action}</Tag>
+                        {step.observation}
+                      </Typography.Paragraph>
+                    ))}
+                  </details>
+                )}
+              </Card>
+            ))
+          )}
+        </Space>
+      </Drawer>
+
+      {/* 失败诊断 agent：读结论或新起任务；默认只分析，重跑需显式勾选 */}
+      <Modal
+        title={diagnoseTask ? `AI 诊断 · 任务 #${diagnoseTask.id}` : 'AI 诊断'}
+        open={!!diagnoseTask}
+        onCancel={() => setDiagnoseTask(null)}
+        width={640}
+        destroyOnClose
+        footer={
+          <Space>
+            <Button onClick={() => setDiagnoseTask(null)}>关闭</Button>
+            <Button
+              type="primary"
+              icon={<RobotOutlined />}
+              loading={diagnoseBusy}
+              onClick={() => void submitDiagnosis()}
+            >
+              {diagnosis?.found ? '重新诊断' : '开始诊断'}
+            </Button>
+          </Space>
+        }
+      >
+        {diagnoseTask && (
+          <Space direction="vertical" size={12} style={{ width: '100%' }}>
+            <Alert
+              type="error"
+              showIcon
+              message="失败原因"
+              description={diagnoseTask.error || '未记录错误'}
+            />
+            {diagnosisLoading ? (
+              <Typography.Text type="secondary">正在读取诊断记录…</Typography.Text>
+            ) : diagnosis?.found ? (
+              <>
+                <Space size={6} wrap>
+                  <Tag
+                    color={(DIAGNOSIS_STATUS[diagnosis.status ?? ''] ?? { color: 'default' }).color}
+                  >
+                    {(DIAGNOSIS_STATUS[diagnosis.status ?? ''] ?? { text: diagnosis.status }).text}
+                  </Tag>
+                  {diagnosisReport && (
+                    <Tag color="blue">
+                      {diagnosisReport.category_label || diagnosisReport.category}
+                    </Tag>
+                  )}
+                  {diagnosisReport && (
+                    <Tag>{CONFIDENCE_LABEL[diagnosisReport.confidence] ?? diagnosisReport.confidence}</Tag>
+                  )}
+                  {diagnosis.model && <Tag>{diagnosis.model}</Tag>}
+                  <Tag>步骤 {diagnosis.steps ?? 0}</Tag>
+                </Space>
+                {diagnosisReport?.suggestion && (
+                  <Alert
+                    type="info"
+                    showIcon
+                    message="建议"
+                    description={diagnosisReport.suggestion}
+                  />
+                )}
+                {diagnosisReport?.evidence?.length ? (
+                  <div>
+                    <Typography.Text strong style={{ fontSize: 13 }}>
+                      判断依据
+                    </Typography.Text>
+                    {diagnosisReport.evidence.map((item, index) => (
+                      <Typography.Paragraph key={index} style={{ fontSize: 12.5, margin: '4px 0 0' }}>
+                        · {item}
+                      </Typography.Paragraph>
+                    ))}
+                  </div>
+                ) : null}
+                {diagnosis.summary?.retry_task_id && (
+                  <Alert
+                    type="warning"
+                    showIcon
+                    message={`已创建独立重跑任务 #${diagnosis.summary.retry_task_id}（不推进原链）`}
+                  />
+                )}
+                {diagnosis.error && (
+                  <Alert type="error" showIcon message="诊断执行失败" description={diagnosis.error} />
+                )}
+                {(diagnosis.trace ?? []).length > 0 && (
+                  <div>
+                    <Typography.Text strong style={{ fontSize: 13 }}>
+                      工具轨迹
+                    </Typography.Text>
+                    {diagnosis.trace!.map((step, index) => (
+                      <Card
+                        key={`${step.step}-${index}`}
+                        size="small"
+                        style={{ marginTop: 6 }}
+                        styles={{ body: { padding: 8 } }}
+                      >
+                        <Space size={6} wrap style={{ marginBottom: 4 }}>
+                          <Tag>第 {step.step} 步</Tag>
+                          <Tag color={step.ok ? 'blue' : 'red'}>{step.action}</Tag>
+                        </Space>
+                        {step.thought ? (
+                          <Typography.Paragraph style={{ fontSize: 12.5, marginBottom: 4 }}>
+                            判断：{step.thought}
+                          </Typography.Paragraph>
+                        ) : null}
+                        <Typography.Paragraph type="secondary" style={{ fontSize: 12, marginBottom: 0 }}>
+                          观察：{step.observation}
+                        </Typography.Paragraph>
+                      </Card>
+                    ))}
+                  </div>
+                )}
+              </>
+            ) : (
+              <Alert
+                type="info"
+                showIcon
+                message="还没有诊断记录"
+                description="启动后 agent 会读取任务参数、镜头与凭证状态，给出归因与处理建议；默认不重跑。"
+              />
+            )}
+            <Checkbox checked={allowRetry} onChange={(event) => setAllowRetry(event.target.checked)}>
+              允许 agent 换一套凭证重跑一次（会产生费用；新任务是独立任务，不推进原链）
+            </Checkbox>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              诊断只给建议，不会修改原任务、镜头状态或已生成素材。
+            </Typography.Text>
+          </Space>
+        )}
+      </Modal>
+
       <TaskDetailDrawer task={detail} onClose={() => setDetailId(null)} />
     </div>
   )
@@ -629,6 +962,19 @@ function TaskDetailDrawer({
 
           {task.error && (
             <Alert type="error" showIcon message="失败原因" description={task.error} />
+          )}
+
+          {task.kind === 'diagnose' && task.result?.diagnosis && (
+            <Alert
+              type="info"
+              showIcon
+              message={`AI 诊断：${task.result.diagnosis.category_label ?? task.result.diagnosis.category ?? '未知'}`}
+              description={task.result.diagnosis.suggestion}
+            />
+          )}
+
+          {task.kind === 'cut_repair' && task.result?.summary && (
+            <Alert type="info" showIcon message="切点修复结论" description={task.result.summary} />
           )}
 
           {task.result?.url ? (

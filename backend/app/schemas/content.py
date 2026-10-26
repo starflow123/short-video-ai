@@ -118,6 +118,22 @@ class ShotPlanRequest(BaseModel):
     shot_count: int | None = Field(default=None, ge=1, le=60)
     target_seconds: int | None = Field(default=None, ge=5, le=900)
     style: str | None = None
+    # 导演自检：结构校验通过时不产生额外模型调用；可关闭
+    review: bool = True
+
+
+class ShotPlanIssueRead(BaseModel):
+    level: str
+    code: str
+    message: str
+
+
+class ShotPlanReviewRead(BaseModel):
+    status: str
+    issues: list[ShotPlanIssueRead] = Field(default_factory=list)
+    revisions: int = 0
+    trace: list[dict] = Field(default_factory=list)
+    message: str | None = None
 
 
 class ShotPlanRead(BaseModel):
@@ -126,6 +142,8 @@ class ShotPlanRead(BaseModel):
     shot_seconds: int = 8
     target_seconds: int = 0
     beats: list[ShotPlanBeatRead] = Field(default_factory=list)
+    # AI 自检结论（只建议，不阻断）；未开启 / 自检不可用时为 None 或 status=unavailable
+    review: ShotPlanReviewRead | None = None
 
 
 # ---------------- 分镜 ----------------
@@ -315,12 +333,18 @@ class ShotRead(BaseModel):
     prompt_confirmed: bool = False
     video_media_id: int | None = None
     video_url: str | None = None
+    # 厂商对视频分辨率做了降档时的说明（例如 Agnes 只出 720P），不能静默当高清交付
+    video_note: str | None = None
     # 与上一镜的切点审查结论（AI 建议；视频未变时复用）
     continuity_review: dict | None = None
     keyframes: list[ShotKeyframeRead] = Field(default_factory=list)
     # 前后镜头（生成提示词时会自动带入，用于保障画面连续性）
     prev_shot: ShotNeighborRead | None = None
     next_shot: ShotNeighborRead | None = None
+    # 本镜头最近一次生成时「显式勾选」的关联资产：弹窗重开时回填，省得每次重选。
+    # 空数组 = 上次走自动绑定，不是「没锁资产」，所以前端不会拿它去覆盖自动策略。
+    last_image_asset_ids: list[int] = Field(default_factory=list)
+    last_video_asset_ids: list[int] = Field(default_factory=list)
 
     @field_validator("subjects", "props", "action_timeline", mode="before")
     @classmethod

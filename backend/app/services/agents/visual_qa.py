@@ -19,8 +19,10 @@ from app.core.config import settings
 from app.models.asset import ProductionAsset
 from app.models.episode import Episode
 from app.models.media import MediaAsset
+from app.models.project import Project
 from app.models.shot import Shot
 from app.services import prompts, storage
+from app.services.agents.audit import record_run
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +33,7 @@ CHECK_LABELS: dict[str, str] = {
     "prop_holder": "道具归属",
     "duplicate_person": "有无分身",
     "composition": "构图景别",
+    "style_match": "画风一致",
 }
 _ALLOWED = {"pass", "warn", "fail", "unknown"}
 _MAX_SHEETS = 3
@@ -105,7 +108,11 @@ def _prop_lines(props: list) -> list[str]:
 
 
 def build_review_prompt(
-    shot: Shot, *, image_labels: list[str], actual_prompt: str | None = None
+    shot: Shot,
+    *,
+    image_labels: list[str],
+    actual_prompt: str | None = None,
+    visual_style: str | None = None,
 ) -> str:
     subjects = _as_list(shot.subjects)
     props = _as_list(shot.props)
@@ -123,8 +130,15 @@ def build_review_prompt(
     if _text(shot.camera):
         camera_bits.append(f"机位：{_text(shot.camera)}")
 
-    if subjects:
-        cast_rule = f"出场角色（画面应恰好出现 {len(subjects)} 个可辨认人物）"
+    # 人数只数「人」：猫狗这类非人形主体写进「应恰好出现 N 个可辨认人物」，
+    # 审查器会把正确画面判成缺人、把多画的分身判成合格。
+    human_names, creature_names = prompts.split_subject_names(_as_list(shot.subjects))
+    if human_names:
+        cast_rule = f"出场角色（画面应恰好出现 {len(human_names)} 个可辨认人物）"
+        if creature_names:
+            cast_rule += f"，另有动物 {'、'.join(creature_names)}（画成动物，不计入人物数）"
+    elif creature_names:
+        cast_rule = f"本镜没有人物，只有动物 {'、'.join(creature_names)}（画面不应出现可辨认人物）"
     else:
         cast_rule = "本镜为空镜：不应出现可辨认人物"
     cast_block = "\n".join(f"{index}. {line}" for index, line in enumerate(_subject_lines(subjects), 1))
@@ -139,6 +153,9 @@ def build_review_prompt(
     ]
     if camera_bits:
         sections.append("镜头要求：" + "；".join(camera_bits))
+    style_text = _text(visual_style)
+    if style_text:
+        sections.append(f"项目视觉风格（画风硬要求）：{style_text}")
     sections.append(cast_rule + "：")
     sections.append(cast_block or "（未建档，按画面描述判断）")
     if prop_block:
@@ -150,19 +167,26 @@ def build_review_prompt(
     if used_prompt:
         sections.append("【生成时使用的画面提示词（仅供对照）】")
         sections.append(used_prompt[:600])
+    style_rule = (
+        "- style_match：图1的画法类别（真人照片 / 手绘动画 / 3D / 水墨等）是否与【项目视觉风格】一致；"
+        "明显不是同一种（要求手绘动画却出成真人照片）给 fail。只判画法类别，不判美丑。\n"
+        if style_text
+        else ""
+    )
+    style_key = ',"style_match":"..."' if style_text else ""
     sections.append(
-        """【判定规则】
+        f"""【判定规则】
 - face_match：图1中的角色与对应定妆照是否为同一人（五官、脸型、发型、年龄段、性别）。没有定妆照可比对时给 unknown。
 - costume_match：服装 / 发型 / 配饰是否与本镜要求一致；换装、少穿、颜色明显不符给 fail。
-- cast_count：图1中可辨认的人物数量是否等于出场角色数。多出的人（含路人、被复制的人）算问题；远景虚化人群不计。
+- cast_count：图1中可辨认的人物数量是否等于【本镜要求】写明的人物数。多出的人（含路人、被复制的人）算问题；列在「另有动物」里的主体按动物核对，不算人物缺失；远景虚化人群不计。
 - prop_holder：本镜道具是否出现、是否由指定角色持有；道具缺失或换人持有给 fail。
 - duplicate_person：同一角色是否在图1中出现两次（镜面、倒影、照片里的影像不算）。
 - composition：是否明显违反景别、机位或构图要求；不评价画风美丑。
-- 本镜为空镜时：face_match / costume_match / duplicate_person 不适用，一律给 pass；cast_count 只检查是否出现可辨认人物。
+{style_rule}- 本镜为空镜时：face_match / costume_match / duplicate_person 不适用，一律给 pass；cast_count 只检查是否出现可辨认人物。
 - 只报你能从图中确认的事实；看不清给 unknown，不要猜测。
 
 【输出】
-{"verdict":"pass|warn|fail","checks":{"face_match":"pass|warn|fail|unknown","costume_match":"...","cast_count":"...","prop_holder":"...","duplicate_person":"...","composition":"..."},"reasons":["最多 5 条，只写不合格或不确定的项，写清哪个角色/道具、错在哪；合格项不要写"],"prompt_patch":"仅 warn/fail 时给一句可直接追加到画面描述的修正建议（不超过 80 字，只补视觉事实，不推翻人数/服装/道具硬约束）；pass 时为空字符串"}
+{{"verdict":"pass|warn|fail","checks":{{"face_match":"pass|warn|fail|unknown","costume_match":"...","cast_count":"...","prop_holder":"...","duplicate_person":"...","composition":"..."{style_key}}},"reasons":["最多 5 条，只写不合格或不确定的项，写清哪个角色/道具、错在哪；合格项不要写"],"prompt_patch":"仅 warn/fail 时给一句可直接追加到画面描述的修正建议（不超过 80 字，只补视觉事实，不推翻人数/服装/道具硬约束）；pass 时为空字符串"}}
 verdict 规则：任一项 fail => fail；没有 fail 但有 warn/unknown => warn；全部 pass => pass。"""
     )
     return "\n".join(sections)
@@ -250,12 +274,17 @@ def normalize_review(
     model: str,
     media_id: int,
     subject_count: int | None = None,
+    has_style: bool = True,
 ) -> dict:
     raw_checks = data.get("checks") if isinstance(data.get("checks"), dict) else {}
     checks: dict[str, str] = {}
     for key in CHECK_LABELS:
         value = _text(raw_checks.get(key)).lower()
         checks[key] = value if value in _ALLOWED else "unknown"
+
+    # 项目没填视觉风格时没有画风可比：不适用不算风险，否则每张都会被标成有风险
+    if not has_style:
+        checks["style_match"] = "pass"
 
     # 空镜没有人物可比对：这两项「看不清」不代表风险，否则每张空镜都会被标成有风险
     if subject_count == 0:
@@ -302,7 +331,11 @@ async def review_keyframe(
     失败时直接抛异常，由调用方决定「自动审查静默跳过 / 手动审查报错」。
     """
     # 延迟导入：generation 在生图流程里会调用本模块，模块级互相 import 会成环
-    from app.services.generation import build_provider_from, resolve_credential
+    from app.services.generation import (
+        _project_style_text,
+        build_provider_from,
+        resolve_credential,
+    )
 
     credential = await resolve_credential(session, user_id, "vision")
     provider = build_provider_from(credential)
@@ -321,10 +354,18 @@ async def review_keyframe(
         f"图{index}：{label}" for index, (label, _) in enumerate(sheets, start=2)
     ]
     meta = asset.meta or {}
+    episode = await session.get(Episode, shot.episode_id) if shot.episode_id else None
+    project = (
+        await session.get(Project, episode.project_id)
+        if episode and episode.project_id
+        else None
+    )
+    visual_style = _project_style_text(project)
     prompt = build_review_prompt(
         shot,
         image_labels=labels,
         actual_prompt=str(meta.get("prompt_clean") or meta.get("prompt_used") or ""),
+        visual_style=visual_style,
     )
 
     raw = await provider.generate_vision(
@@ -346,11 +387,33 @@ async def review_keyframe(
         provider=credential.provider,
         model=provider.model_for("vision"),
         media_id=int(asset.id),
-        subject_count=len(_as_list(shot.subjects)),
+        # 只有「人物」参与空镜判定：猫这类非人形主体没有脸可比对
+        subject_count=len(prompts.split_subject_names(_as_list(shot.subjects))[0]),
+        has_style=bool(visual_style),
     )
     review["reference_sheets"] = len(sheets)
     asset.meta = {**(asset.meta or {}), "visual_review": review}
     await session.flush()
+    # 单次审查器也进统一审计：否则「AI 处理记录」只能看到 5 个循环 agent，审计是残缺的
+    await record_run(
+        session,
+        user_id=user_id,
+        kind="visual_review",
+        status=review["verdict"],
+        project_id=episode.project_id if episode else None,
+        target_type="media",
+        target_id=int(asset.id),
+        model=review["model"],
+        steps=1,
+        summary={
+            "verdict": review["verdict"],
+            "checks": review["checks"],
+            "reasons": review["reasons"],
+            "prompt_patch": review["prompt_patch"],
+            "reference_sheets": review["reference_sheets"],
+            "shot_id": int(shot.id),
+        },
+    )
     return review
 
 
